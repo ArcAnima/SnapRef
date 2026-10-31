@@ -7,6 +7,11 @@
 > preview builds** with a much stronger character mode, several references of one character, and per-reference
 > weights. [What is new in v2a](#v2a-preview). v1a stays the recommended release.
 
+> [!IMPORTANT]
+> **Please support SnapRef!** Developing these models has taken **400+ H100 GPU-hours** so far.
+> If SnapRef is useful to you, a ⭐ on [GitHub](https://github.com/ArcAnima/SnapRef), sharing your results or
+> reporting issues helps a lot, and GPU sponsorship is very welcome.
+
 <p align="center">
   <a href="https://huggingface.co/0ppxnhximxr/snapref-v1a"><img src="https://img.shields.io/badge/🤗%20weights-snapref--v1a-ffcc4d" alt="weights v1a"></a>
   <a href="https://huggingface.co/0ppxnhximxr/snapref-v1b"><img src="https://img.shields.io/badge/🤗%20weights-snapref--v1b-ff6a62" alt="weights v1b"></a>
