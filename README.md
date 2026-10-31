@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/hero.jpg" width="100%" alt="SnapRef v1a: one reference image, any pose, any scene">
+  <img src="assets/v2a/hero_pre1_pre2.jpg" width="100%" alt="SnapRef v2a-pre1 and v2a-pre2: one reference image, any pose, any scene">
 </p>
 
 > [!NOTE]
@@ -74,8 +74,6 @@ masterpiece, best quality, score_7, safe, 1girl, solo, full body, sitting, cross
 > All node settings are explained in the [model card](https://huggingface.co/0ppxnhximxr/snapref-v1a#settings).
 
 ## v2a preview
-
-<p align="center"><img src="assets/v2a/hero.jpg" width="100%" alt="SnapRef v2a preview"></p>
 
 Two checkpoints of the v2a run, released as previews: **v2a-pre1** (step 10,000) and **v2a-pre2** (step 15,000).
 Both continue from v1a on a mix of real Danbooru illustrations (80 %) and Anima-generated images (20 %).
