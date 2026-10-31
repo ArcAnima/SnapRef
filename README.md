@@ -24,13 +24,14 @@
 
 <p align="center">
   <b>Give Anima one picture of a character. Write only the scene.</b><br>
-  Hair, eyes, outfit and style come from the reference, and they follow the new pose.
+  Hair, eyes and outfit come from the reference and follow the new pose. The art style comes from the reference too,<br>
+  or, with <code>mode char</code>, from the base model and your prompt.
 </p>
 
 <p align="center">
   <a href="#quick-start">Quick start</a> ·
   <a href="#v2a-preview">v2a preview</a> ·
-  <a href="#results">Results</a> ·
+  <a href="#results-v1a">Results</a> ·
   <a href="#how-it-works">How it works</a> ·
   <a href="#training-it-yourself">Training</a> ·
   <a href="#roadmap">Roadmap</a>
@@ -52,7 +53,8 @@ works with all of them.
 |---|---|
 | ⚡ **Fast** | The reference is encoded once and its keys/values are cached. Generation is about 15 % slower than plain Anima, and faster than the other Anima reference adapters. |
 | 🎯 **Scene-only prompts** | No character name, appearance or artist tags. The reference carries them. |
-| 🧩 **Drop-in node** | One ComfyUI node patches the model. Works with the bf16 and the FP8 Anima base. |
+| 🔌 **Drop-in node** | One ComfyUI node patches the model. Works with the bf16 and the FP8 Anima base. |
+| 🎨 **Character reference** | `mode char` takes the character and leaves the reference's art style behind (much stronger in v2a). |
 | 👥 **Two characters** | Stitch two references side by side and prompt `2girls`. |
 | 🧩 **Several references, one character** | `image_2`, `image_3`: e.g. an upper-body shot for the face and a full-body shot for the outfit. |
 | ⚖️ **Reference weights** | `weight_1` … `weight_3`: how much each reference counts, without slowing generation down. |
@@ -60,10 +62,19 @@ works with all of them.
 ## Quick start
 
 1. Install Anima base v1.0 with its text encoder and VAE in ComfyUI.
-2. Download the files from [Hugging Face](https://huggingface.co/0ppxnhximxr/snapref-v1a):
-   - copy `comfyui/snapref/` to `ComfyUI/custom_nodes/`;
-   - put `snapref_v1a.safetensors` (or the FP8 file) in `ComfyUI/models/loras/`.
-3. Open `workflows/snapref_v1a.json`, load a reference image and queue.
+2. Copy [`comfyui_nodes/snapref/`](comfyui_nodes/snapref) from this repository to `ComfyUI/custom_nodes/snapref/`
+   (replace an older SnapRef node). This is the newest node; it works with every SnapRef version.
+3. Put the weights in `ComfyUI/models/loras/`:
+
+   | weights | |
+   |---|---|
+   | [`snapref_v1a.safetensors`](https://huggingface.co/0ppxnhximxr/snapref-v1a) | recommended |
+   | [`snapref_v2a_pre2.safetensors`](https://huggingface.co/0ppxnhximxr/snapref-v2a-pre2) | preview: stronger `mode char`; try this one first of the two previews |
+   | [`snapref_v2a_pre1.safetensors`](https://huggingface.co/0ppxnhximxr/snapref-v2a-pre1) | preview: earlier checkpoint |
+   | [`snapref_v1b.safetensors`](https://huggingface.co/0ppxnhximxr/snapref-v1b) | twice the LoRA rank of v1a |
+
+   Each also comes as an FP8 file (half the size).
+4. Open a workflow from the same Hugging Face page (`workflows/`), load a reference image and queue.
 
 ```text
 masterpiece, best quality, score_7, safe, 1girl, solo, full body, sitting, crossed legs, bench, street, night
@@ -71,12 +82,23 @@ masterpiece, best quality, score_7, safe, 1girl, solo, full body, sitting, cross
 
 > [!NOTE]
 > SnapRef is not a regular LoRA. Load it with the **SnapRef** node, not with LoraLoader.
-> All node settings are explained in the [model card](https://huggingface.co/0ppxnhximxr/snapref-v1a#settings).
+> The basic settings are explained in the [v1a model card](https://huggingface.co/0ppxnhximxr/snapref-v1a#settings);
+> the inputs added for v2a are below.
+
+| new node input | default | |
+|---|---|---|
+| `image_2`, `image_3` | | more references of the **same** character (e.g. full body when `image` is an upper-body shot) |
+| `use_batch` | off | use every image of an IMAGE batch as a reference |
+| `multi_layout` | `separate` | `separate`: each reference on its own. `stitch`: side by side in one reference (same speed as one image) |
+| `weight_1` … `weight_3` | 1.0 | how much each reference counts (0–2, 0 = skipped); separate layout only |
+
+The new inputs sit at the end of the node, so saved v1 workflows open unchanged.
 
 ## v2a preview
 
 Two checkpoints of the v2a run, released as previews: **v2a-pre1** (step 10,000) and **v2a-pre2** (step 15,000).
 Both continue from v1a on a mix of real Danbooru illustrations (80 %) and Anima-generated images (20 %).
+Try **pre2** first; pre1 is kept for comparison. Neither replaces v1a.
 
 **Character reference (`mode char`).** The largest change. v2a takes the character from the reference and leaves
 its art style behind; the base model and your prompt set the look.
@@ -105,7 +127,7 @@ In `cs` mode neither build is better than v1a yet; pre2 is close. Real illustrat
 help, so the next run (v2a-syn) uses Anima-generated images only: 121,642 images of 5,886 characters
 (`configs/datagen_scenes_v2.json`, `datagen/clean_tags_v2.py`). The evaluation is in `train/detail_eval/`.
 
-## Results
+## Results (v1a)
 
 <p align="center"><img src="assets/heldout.jpg" width="100%" alt="held-out characters, same seed for every method"></p>
 <p align="center"><sub>Characters that were not in the training data. Every method gets the same prompt and seed; the prompt describes only the scene.</sub></p>
@@ -144,8 +166,11 @@ flowchart LR
 - **Two LoRAs.** The reference branch and the target branch each have their own LoRA (v1a: rank 128 and 64).
 - **Separate position.** The reference sits at its own place in the model's RoPE coordinates, so it is read for
   appearance and not copied as a layout.
-- **Training data.** 58,300 images generated with Anima itself (`scenes3x4`): 2,367 characters, each drawn in
+- **Several references.** Each reference is encoded on its own and the cached K/V of all of them are
+  concatenated; a reference weight adds `log(w)` to that reference's keys.
+- **Training data.** v1a: 58,300 images generated with Anima itself (`scenes3x4`): 2,367 characters, each drawn in
   several scenes and poses in one artist style. The training prompt leaves out what the reference supplies.
+  v2a: continued from v1a with 231,724 Danbooru illustrations (33,666 characters) as 80 % of the pairs.
 
 ## Training it yourself
 
@@ -156,6 +181,8 @@ PROJECT_ROOT=$PWD bash deploy/run_scenes3x4.sh production
 GPUS=0,1 FIRST=v1a bash deploy/train_pipeline.sh   # configs/train_asym_<name>.json
 # 3. score a comparison run
 python train/score_panels.py RUN_A RUN_B --label a b --out scores.json
+# v2a: continue from v1a on the merged real + generated prep (configs/train_v2a.json)
+python train/train_asym.py --prep v2_mix_prep --config configs/train_v2a.json --init snapref_v1a.safetensors --out runs/v2a
 ```
 
 | path | |
@@ -167,14 +194,15 @@ python train/score_panels.py RUN_A RUN_B --label a b --out scores.json
 | `comfyui_nodes/snapref/` | the ComfyUI node (bf16 and FP8; multi-reference, reference weights) |
 | `train/detail_eval/` | detail evaluation: frozen set, renders, tag / head-crop features, paired CIs, watcher |
 | `train/multiref_test.py`, `train/ccip_eval.py` | multi-reference test, CCIP identity scores |
+| `datagen/select_v2_images.py`, `datagen/build_pairs_v2.py`, `train/D_build_v2_prep.py`, `train/D_merge_preps.py` | v2a data: Danbooru selection (tags only), training pairs, prep, merge with the generated prep |
 | `datagen/clean_tags_v2.py`, `configs/datagen_scenes_v2.json` | the scenes_v2 synthetic data run (v2a-syn) |
 | `train/style_research/`, `train/style_*.py` | the v2 style-transfer experiments (did not beat the baseline) |
 | `datagen/` | tag catalogs, scene manifests, pose extension, ComfyUI batch workflow and GPU worker |
-| `configs/` | the configs of the released runs: `datagen_scenes.json`, `train_asym.json` (v1a), `train_asym_v1b.json` |
+| `configs/` | the configs of the released runs: `datagen_scenes.json`, `train_asym.json` (v1a), `train_asym_v1b.json`, `train_v2a.json` (v2a-pre1 / pre2), `datagen_scenes_v2.json` |
 | `comfyui_nodes/anima_ref_datagen_nodes/` | batched generation nodes used to render the training data |
 | `deploy/` | GPU box setup, data generation launcher, training pipeline, FP8 conversion |
 
-Data generation and training of v1a together took about 120 H100 GPU-hours.
+Data generation and training of v1a alone took about 120 H100 GPU-hours.
 
 ## Roadmap
 
@@ -208,10 +236,12 @@ Data generation and training of v1a together took about 120 H100 GPU-hours.
 - Very small details (earrings, fine patterns, scars) can be simplified.
 - A dark-skinned reference can come out with lighter skin.
 - A scene can override the reference outfit (*beach* → swimsuit). Raise `strength` or name the outfit.
+- v2a previews: faces match slightly less closely than with v1a, most of all with real artwork as the reference.
+- v2a `mode char`: a few outfit details of the reference can change (a patterned item drawn plain, a hat left out).
 
 ## License
 
 - **Code:** Apache-2.0 ([LICENSE](LICENSE)).
 - **Weights:** a derivative of the CircleStone Model, under the CircleStone Labs Non-Commercial License v1.2
-  (see the [model card](https://huggingface.co/0ppxnhximxr/snapref-v1a)). Images generated with Anima are
+  (see the model cards, e.g. [v1a](https://huggingface.co/0ppxnhximxr/snapref-v1a)). Images generated with Anima are
   subject to that license as well. Not affiliated with or endorsed by CircleStone Labs.
