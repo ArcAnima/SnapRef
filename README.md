@@ -2,9 +2,15 @@
   <img src="assets/hero.jpg" width="100%" alt="SnapRef v1a: one reference image, any pose, any scene">
 </p>
 
+> [!NOTE]
+> **New: [v2a-pre1](https://huggingface.co/0ppxnhximxr/snapref-v2a-pre1) and [v2a-pre2](https://huggingface.co/0ppxnhximxr/snapref-v2a-pre2)
+> preview builds** with a much stronger character mode, several references of one character, and per-reference
+> weights. [What is new in v2a](#v2a-preview). v1a stays the recommended release.
+
 <p align="center">
   <a href="https://huggingface.co/0ppxnhximxr/snapref-v1a"><img src="https://img.shields.io/badge/🤗%20weights-snapref--v1a-ffcc4d" alt="weights v1a"></a>
   <a href="https://huggingface.co/0ppxnhximxr/snapref-v1b"><img src="https://img.shields.io/badge/🤗%20weights-snapref--v1b-ff6a62" alt="weights v1b"></a>
+  <a href="https://huggingface.co/0ppxnhximxr/snapref-v2a-pre2"><img src="https://img.shields.io/badge/🤗%20preview-v2a--pre1%20·%20pre2-ff5a1f" alt="v2a preview"></a>
   <img src="https://img.shields.io/badge/base-Anima%20v1.0-4b5bd6" alt="base model">
   <img src="https://img.shields.io/badge/ComfyUI-custom%20node-1b1b1f" alt="ComfyUI">
   <img src="https://img.shields.io/badge/weights-bf16%20%7C%20FP8-6c6a72" alt="bf16 / fp8">
@@ -18,6 +24,7 @@
 
 <p align="center">
   <a href="#quick-start">Quick start</a> ·
+  <a href="#v2a-preview">v2a preview</a> ·
   <a href="#results">Results</a> ·
   <a href="#how-it-works">How it works</a> ·
   <a href="#training-it-yourself">Training</a> ·
@@ -28,8 +35,11 @@
 
 This repository holds the training, data generation and evaluation code behind **SnapRef**, a reference adapter
 for [Anima](https://huggingface.co/circlestone-labs/Anima) base v1.0. The released weights, ComfyUI node and
-workflows are on Hugging Face: **[snapref-v1a](https://huggingface.co/0ppxnhximxr/snapref-v1a)** (recommended) and
-**[snapref-v1b](https://huggingface.co/0ppxnhximxr/snapref-v1b)** (twice the LoRA rank).
+workflows are on Hugging Face: **[snapref-v1a](https://huggingface.co/0ppxnhximxr/snapref-v1a)** (recommended),
+**[snapref-v1b](https://huggingface.co/0ppxnhximxr/snapref-v1b)** (twice the LoRA rank), and the preview builds
+**[snapref-v2a-pre1](https://huggingface.co/0ppxnhximxr/snapref-v2a-pre1)** and
+**[snapref-v2a-pre2](https://huggingface.co/0ppxnhximxr/snapref-v2a-pre2)**. The node in `comfyui_nodes/snapref/`
+works with all of them.
 
 ## Highlights
 
@@ -39,6 +49,8 @@ workflows are on Hugging Face: **[snapref-v1a](https://huggingface.co/0ppxnhximx
 | 🎯 **Scene-only prompts** | No character name, appearance or artist tags. The reference carries them. |
 | 🧩 **Drop-in node** | One ComfyUI node patches the model. Works with the bf16 and the FP8 Anima base. |
 | 👥 **Two characters** | Stitch two references side by side and prompt `2girls`. |
+| 🧩 **Several references, one character** | `image_2`, `image_3`: e.g. an upper-body shot for the face and a full-body shot for the outfit. |
+| ⚖️ **Reference weights** | `weight_1` … `weight_3`: how much each reference counts, without slowing generation down. |
 
 ## Quick start
 
@@ -55,6 +67,40 @@ masterpiece, best quality, score_7, safe, 1girl, solo, full body, sitting, cross
 > [!NOTE]
 > SnapRef is not a regular LoRA. Load it with the **SnapRef** node, not with LoraLoader.
 > All node settings are explained in the [model card](https://huggingface.co/0ppxnhximxr/snapref-v1a#settings).
+
+## v2a preview
+
+<p align="center"><img src="assets/v2a/hero.jpg" width="100%" alt="SnapRef v2a preview"></p>
+
+Two checkpoints of the v2a run, released as previews: **v2a-pre1** (step 10,000) and **v2a-pre2** (step 15,000).
+Both continue from v1a on a mix of real Danbooru illustrations (80 %) and Anima-generated images (20 %).
+
+**Character reference (`mode char`).** The largest change. v2a takes the character from the reference and leaves
+its art style behind; the base model and your prompt set the look.
+
+<p align="center"><img src="assets/v2a/character_reference.jpg" width="100%" alt="mode char: v1a vs v2a"></p>
+
+**Several references of one character.** Each reference is encoded on its own and the image reads all of them.
+
+<p align="center"><img src="assets/v2a/multi_reference.jpg" width="100%" alt="multi-reference"></p>
+
+**Reference weights.** `log(w)` on that reference's attention keys, computed without an attention mask (fused
+attention per key group, merged by log-sum-exp), so `strength` and weights no longer slow generation down.
+
+<p align="center"><img src="assets/v2a/reference_weights.jpg" width="100%" alt="reference weights"></p>
+
+**How v2a compares to v1a** (detail evaluation, 64 cases × 2 seeds, difference to v1a, 95 % CI):
+
+| | v2a-pre1 | v2a-pre2 |
+|---|---:|---:|
+| appearance tags kept ↑ | −0.014 [−0.047, +0.019] | −0.015 [−0.051, +0.021] |
+| head-crop SigLIP2 ↑ | −0.018 [−0.025, −0.011] | −0.005 [−0.010, −0.001] |
+| head-crop CCIP distance ↓ | +0.010 [+0.003, +0.017] | +0.005 [+0.001, +0.009] |
+| head-crop CCIP distance, real-art references ↓ | +0.019 [+0.009, +0.032] | +0.010 [+0.004, +0.015] |
+
+In `cs` mode neither build is better than v1a yet; pre2 is close. Real illustrations as training targets did not
+help, so the next run (v2a-syn) uses Anima-generated images only: 121,642 images of 5,886 characters
+(`configs/datagen_scenes_v2.json`, `datagen/clean_tags_v2.py`). The evaluation is in `train/detail_eval/`.
 
 ## Results
 
@@ -115,7 +161,11 @@ python train/score_panels.py RUN_A RUN_B --label a b --out scores.json
 | `train/prepare_asym.py`, `train/train_asym.py` | tensor preparation and training |
 | `train/eval_asym.py`, `train/compare_refs.py`, `train/score_panels.py` | held-out loss gaps, side-by-side runs against other adapters, embedding scores |
 | `train/anima_env.py`, `train/sample.py`, `train/preview.py`, `train/prepare*.py` | model plumbing on top of ComfyUI, sampling, in-training previews, shared data helpers |
-| `comfyui_nodes/snapref/` | the ComfyUI node (bf16 and FP8) |
+| `comfyui_nodes/snapref/` | the ComfyUI node (bf16 and FP8; multi-reference, reference weights) |
+| `train/detail_eval/` | detail evaluation: frozen set, renders, tag / head-crop features, paired CIs, watcher |
+| `train/multiref_test.py`, `train/ccip_eval.py` | multi-reference test, CCIP identity scores |
+| `datagen/clean_tags_v2.py`, `configs/datagen_scenes_v2.json` | the scenes_v2 synthetic data run (v2a-syn) |
+| `train/style_research/`, `train/style_*.py` | the v2 style-transfer experiments (did not beat the baseline) |
 | `datagen/` | tag catalogs, scene manifests, pose extension, ComfyUI batch workflow and GPU worker |
 | `configs/` | the configs of the released runs: `datagen_scenes.json`, `train_asym.json` (v1a), `train_asym_v1b.json` |
 | `comfyui_nodes/anima_ref_datagen_nodes/` | batched generation nodes used to render the training data |
@@ -128,9 +178,11 @@ Data generation and training of v1a together took about 120 H100 GPU-hours.
 - [x] **v1a**: asymmetric attention + K/V cache, 58k generated images. Released.
 - [x] **v1b**: twice the LoRA rank. Keeps the character as well as v1a and follows the prompt slightly more closely.
   Released as [snapref-v1b](https://huggingface.co/0ppxnhximxr/snapref-v1b).
-- [ ] **v2**: generated images cut to half or less, real Danbooru-style illustrations added (100–150k images in total),
-  outfit-change pairs and multi-resolution training. Goal: better results with real artwork as the reference and
-  finer details (accessories, patterns, skin tone).
+- [x] **v2a-pre1 / pre2**: continued from v1a with 80 % real Danbooru illustrations. Much stronger `mode char`;
+  multi-reference and reference weights in the node. Preview builds (Hugging Face, opening soon).
+- [ ] **v2a-syn**: generated images only, 121,642 images of 5,886 characters (2.5× the characters of v1a).
+  Goal: beat v1a on the detail evaluation, especially faces with real artwork as the reference.
+- [ ] Multi-reference training (2–3 references → another pose), style transfer (v2.1+).
 
 ## Compatibility and troubleshooting
 
@@ -145,20 +197,14 @@ Data generation and training of v1a together took about 120 H100 GPU-hours.
   logs a warning.
 - **sorryhyun Mod Guidance:** with the default settings it can stop with a tensor-size error (4 vs 2). Turning on
   `ref_in_uncond` or `ref_guidance_on` avoids it.
+- **SageAttention:** with `strength` or reference weights ≠ 1, the reference part uses PyTorch's fused attention,
+  so a GPU where Sage is much faster can be slightly slower there.
 
 ## Known limitations
 
 - Very small details (earrings, fine patterns, scars) can be simplified.
 - A dark-skinned reference can come out with lighter skin.
 - A scene can override the reference outfit (*beach* → swimsuit). Raise `strength` or name the outfit.
-
-## Credits
-
-This project started as a fork of ElectronGirl's
-[anima-ref-adapter-research](https://github.com/ElectronGirl/anima-ref-adapter-research) and
-[ComfyUI-Anima-Ref-Adapter](https://github.com/ElectronGirl/ComfyUI-Anima-Ref-Adapter), whose early work showed
-that Anima can read a reference image this way. Their original code and README are in the first commit of this
-repository's history.
 
 ## License
 

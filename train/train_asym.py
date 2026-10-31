@@ -45,8 +45,8 @@ class Prep:
         ctx = load_file(str(self.dir / "contexts.safetensors"))
         self._data, self._offsets = ctx["data"], ctx["offsets"].tolist()
         self.latents = {}
-        for name in self.index["files"]["latents"]:
-            self.latents.update(load_file(str(self.dir / name)))
+        for name in self.index["files"]["latents"]:   # may be relative paths into another prep (merge_preps.py)
+            self.latents.update(load_file(str((self.dir / name).resolve())))
 
     def context(self, i: int) -> torch.Tensor:
         return self._data[self._offsets[i]:self._offsets[i + 1]]
@@ -109,6 +109,29 @@ class PairSampler:
         key = self.rng.choices(self.keys[mode], weights=self.key_w[mode])[0]
         pairs, cum = self.buckets[key]
         return mode, self.rng.choices(pairs, cum_weights=cum, k=self.batch)
+
+
+class ListPairSampler(PairSampler):
+    """Pairs given explicitly by the prep (index["pairs"] = {mode: [[target, ref], ...]}, prepare_danbooru.py):
+    modes drawn by adapter.modes weights, then a (target size, ref size) bucket by its pair count, then pairs."""
+
+    def __init__(self, index: dict, mode_probs: dict[str, float], batch: int, seed: int):
+        self.rng = random.Random(seed)
+        self.batch = batch
+        recs = index["records"]
+        buckets = collections.defaultdict(list)
+        for mode, pairs in index["pairs"].items():
+            if mode not in mode_probs:
+                continue
+            for pair in pairs:   # [target, ref] or [target, ref, prompt index] (add_pair_prompts.py)
+                t, r = pair[0], pair[1]
+                buckets[(mode, (recs[t]["width"], recs[t]["height"]), (recs[r]["width"], recs[r]["height"]))].append(tuple(pair))
+        self.modes = [m for m in mode_probs if any(k[0] == m for k in buckets)]
+        self.mode_w = [mode_probs[m] for m in self.modes]
+        self.keys = {m: [k for k in buckets if k[0] == m] for m in self.modes}
+        self.key_w = {m: [len(buckets[k]) for k in self.keys[m]] for m in self.modes}
+        self.buckets = {k: (v, list(range(1, len(v) + 1))) for k, v in buckets.items()}
+        self.counts = {m: sum(len(buckets[k]) for k in self.keys[m]) for m in self.modes}
 
 
 def spawn_preview(args, ckpt: Path, step: int) -> None:
@@ -199,8 +222,13 @@ def main() -> int:
     log(f"self-test: {asym.self_test(dm, device)}")
 
     modules = asym.inject(dm, acfg["lora"])
-    mode_names = list(acfg["modes"])
+    # sampling modes (adapter.modes) vs embedding modes: a prep may sample e.g. "cs_syn" pairs with their own
+    # weight but train the "cs" embedding (index["embed_of_mode"], merge_preps.py); only embedding modes get a vector
+    embed_of_mode = {m: m for m in acfg["modes"]}
+    embed_of_mode.update(prep.index.get("embed_of_mode", {}))
+    mode_names = list(dict.fromkeys(embed_of_mode[m] for m in acfg["modes"]))
     mode_embed = torch.nn.Parameter(torch.zeros(len(mode_names), dm.model_channels, device=device))
+    init_modes = None   # mode names stored in --init's metadata (a new mode, e.g. style, starts from zero)
     params = asym.lora_params(modules) + [mode_embed]
     log(f"lora: ref {sum(p.numel() for p in asym.lora_params(modules, 'ref')) / 1e6:.1f}M, "
         f"tgt {sum(p.numel() for p in asym.lora_params(modules, 'tgt')) / 1e6:.1f}M")
@@ -211,8 +239,12 @@ def main() -> int:
     latents = {k: lf.process_in(v[None].float())[0].to(torch.bfloat16) for k, v in prep.latents.items()}
     del prep.latents
     recs = prep.index["records"]
-    sampler = PairSampler(prep.index, acfg["modes"], config["data"]["cross_weight"], tcfg["batch_size"], seed,
-                          config["data"].get("pose_weight", 1.0))
+    if "pairs" in prep.index:   # explicit pair lists (Danbooru pilot): prompts per mode from prompt_of_mode
+        sampler = ListPairSampler(prep.index, acfg["modes"], tcfg["batch_size"], seed)
+    else:
+        sampler = PairSampler(prep.index, acfg["modes"], config["data"]["cross_weight"], tcfg["batch_size"], seed,
+                              config["data"].get("pose_weight", 1.0))
+    prompt_of_mode = prep.index.get("prompt_of_mode")
     # multi-resolution: a share of the steps uses ~0.56 MP targets (prepare_multires.py); references stay ~1 MP
     low_p = config["data"].get("low_res_p", 0.0)
     low_latents = {}
@@ -232,17 +264,26 @@ def main() -> int:
 
     start_step = 0
     if args.init and not args.resume:
-        asym.load(modules, args.init, {"mode_embed": mode_embed})
-        log(f"initialised from {args.init}")
+        from safetensors import safe_open
+        with safe_open(str(args.init), "pt") as handle:
+            init_modes = json.loads((handle.metadata() or {}).get("anima_ref_kv", "{}")).get("modes", mode_names)
+        old = torch.zeros(len(init_modes), dm.model_channels, device=device)
+        asym.load(modules, args.init, {"mode_embed": old})
+        with torch.no_grad():
+            for i, m in enumerate(mode_names):
+                if m in init_modes:
+                    mode_embed[i].copy_(old[init_modes.index(m)])
+        log(f"initialised from {args.init} (modes {init_modes} -> {mode_names})")
     if args.resume:
         state = torch.load(args.resume, map_location="cpu", weights_only=False)
         asym.load(modules, Path(str(args.resume).replace("state_", "adapter_").replace(".pt", ".safetensors")),
                   {"mode_embed": mode_embed})
         optimizer.load_state_dict(state["optimizer"])
         start_step = state["step"]
-        rng.setstate(state["rng"][rank])
-        sampler.rng.setstate(state["sampler_rng"][rank])
-        torch.set_rng_state(state["torch_rng"][rank].cpu())
+        if rank < len(state["rng"]):   # a resume on more GPUs than saved: the extra ranks keep their fresh seeds
+            rng.setstate(state["rng"][rank])
+            sampler.rng.setstate(state["sampler_rng"][rank])
+            torch.set_rng_state(state["torch_rng"][rank].cpu())
         log(f"resumed at step {start_step}")
 
     metadata = {"format": "anima_ref_kv/1", "base": config["comfy"]["unet_name"], "ref_t": asym.REF_T,
@@ -264,16 +305,23 @@ def main() -> int:
         optimizer.zero_grad(set_to_none=True)
         for _ in range(accum):
             mode, batch = sampler.next()
-            use_low = low_p > 0 and rng.random() < low_p and all(t in low_latents for t, _ in batch)
+            use_low = low_p > 0 and rng.random() < low_p and all(pr[0] in low_latents for pr in batch)
             u = rng.random()
             no_ref = u < drop["ref"] + drop["both"] and has_tgt
             no_text = drop["ref"] <= u < drop["ref"] + drop["both"] + drop["text"]
-            x0 = torch.stack([(low_latents if use_low else latents)[t] for t, _ in batch]).to(device)
+            x0 = torch.stack([(low_latents if use_low else latents)[pr[0]] for pr in batch]).to(device)
             ctxs = []
-            for t, _ in batch:
+            for pr in batch:
+                t = pr[0]
                 p = recs[t]["prompts"]
                 if no_text:
                     ctxs.append(prep.context(empty_ctx))
+                    continue
+                if len(pr) > 2:   # per-pair target prompt
+                    ctxs.append(prep.context(pr[2]))
+                    continue
+                if prompt_of_mode:
+                    ctxs.append(prep.context(p[prompt_of_mode[mode]]))
                     continue
                 table = char_mix if mode == "char" else mix
                 key = rng.choices(list(table), weights=list(table.values()))[0]
@@ -287,13 +335,13 @@ def main() -> int:
             target_v = noise - x0.float()
             cache = None
             if not no_ref:
-                ref = torch.stack([latents[r] for _, r in batch]).to(device)
-                rctx = [prep.context(recs[r]["prompts"]["ref_caption"]) if rng.random() < config["data"]["ref_caption_p"]
-                        else prep.context(empty_ctx) for _, r in batch]
+                ref = torch.stack([latents[pr[1]] for pr in batch]).to(device)
+                rctx = [prep.context(recs[pr[1]]["prompts"]["ref_caption"]) if rng.random() < config["data"]["ref_caption_p"]
+                        else prep.context(empty_ctx) for pr in batch]
                 rcontext = anima_env.pad_contexts(rctx).to(device, torch.bfloat16)
                 m = acfg["ref_offset_max"]
                 offset = (rng.randint(-m, m), rng.randint(-m, m))
-                memb = mode_embed[mode_names.index(mode)].expand(len(batch), -1)
+                memb = mode_embed[mode_names.index(embed_of_mode[mode])].expand(len(batch), -1)
                 cache = asym.encode_reference(dm, ref, rcontext, (x0.shape[-2], x0.shape[-1]), offset=offset,
                                               checkpoint_blocks=ckpt_blocks, mode_emb=memb)
             pred = asym.target_forward(dm, xt, sigma, context, cache, checkpoint_blocks=ckpt_blocks)

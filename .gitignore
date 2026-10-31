@@ -7,3 +7,7 @@ data/*
 *.safetensors
 *.parquet
 *.webp
+# one-off machine scripts with account / instance identifiers (kept locally)
+deploy/g7e_retire.sh
+deploy/pilot_b_launcher.sh
+deploy/spot_spec_square1.json

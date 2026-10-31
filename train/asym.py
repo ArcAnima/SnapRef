@@ -133,7 +133,8 @@ def _install_hooks(dm) -> None:
             state = _attn._asym_state
             if state is not None and "record" in state:
                 state["record"][_attn._asym_index] = (k, v)
-            elif state is not None and state.get("cache") is not None:
+            elif state is not None and state.get("cache") is not None and state["cache"][_attn._asym_index] is not None:
+                # a None entry: this block reads no reference (per-block probes, train/block_probe.py)
                 k_ref, v_ref = state["cache"][_attn._asym_index]
                 if k_ref.shape[0] != k.shape[0]:
                     k_ref = k_ref.expand(k.shape[0], *k_ref.shape[1:])

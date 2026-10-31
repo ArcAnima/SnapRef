@@ -1,0 +1,93 @@
+{
+ "run_name": "scenes_v2",
+ "images_per_group": 4,
+ "seed": 40522060,
+ "workers": 6,
+ "characters": {
+  "catalog": "data/danbooru_characters_v2new_ge300.csv",
+  "min_post_count": 300,
+  "uses_per_character": 3,
+  "exclude_substrings": [
+   "swimsuit",
+   "bikini",
+   "bunny",
+   "lingerie",
+   "nude",
+   "naked",
+   "bath",
+   "underwear",
+   "maid bikini"
+  ],
+  "max_parenthesized_qualifiers": 1,
+  "identity_tags": "data/character_tags_v2new.jsonl",
+  "min_appearance_tags": 2
+ },
+ "artists": {
+  "catalog": "data/danbooru_artists_ge300.csv",
+  "min_post_count": 300,
+  "combo_size_weights": {
+   "1": 0.7,
+   "2": 0.25,
+   "3": 0.05
+  },
+  "mix_weight_range": [
+   0.7,
+   1.2
+  ],
+  "uses_per_combo": 1
+ },
+ "scenes": {
+  "path": "data/scenes.jsonl",
+  "split": "train",
+  "focus_weights": "uniform",
+  "max_group_overlap": 0.5,
+  "exclude_tags": [
+   "seductive_smile",
+   "licking_lips",
+   "naughty_face",
+   "heavy_breathing",
+   "aroused",
+   "bedroom_eyes",
+   "lovestruck",
+   "heart-shaped_pupils",
+   "spoken_heart",
+   "tongue_out",
+   "drooling",
+   "mouth_drool",
+   "sexually_suggestive"
+  ]
+ },
+ "rating": {
+  "default": "safe",
+  "sensitive_ratio": 0.0,
+  "sensitive_allowlist": "data/adult_characters.txt"
+ },
+ "prompt": {
+  "quality": "masterpiece, best quality, score_7, newest, highres, absurdres",
+  "negative": "worst quality, low quality, score_1, score_2, score_3, blurry, jpeg artifacts, chromatic aberration, bad anatomy, bad hands, extra arms, extra fingers, missing fingers, text, watermark, signature, artist name, multiple views, split screen, comic, 2koma, 4koma"
+ },
+ "comfy": {
+  "unet_name": "anima-base-v1.0-fp8.safetensors",
+  "weight_dtype": "default",
+  "clip_name": "qwen_3_06b_base.safetensors",
+  "vae_name": "qwen_image_vae.safetensors",
+  "clip_type": "stable_diffusion"
+ },
+ "sampling": {
+  "steps": 24,
+  "cfg": 4.5,
+  "sampler_name": "er_sde",
+  "scheduler": "sgm_uniform"
+ },
+ "acceleration": {
+  "profile": "baseline",
+  "batch_size": 16
+ },
+ "output": {
+  "image_format": "webp",
+  "webp_quality": 95,
+  "save_latent": true
+ },
+ "id_prefix": "v",
+ "note": "scenes_v2 (2026-10-31): 3,519 new characters (Danbooru >= 300 posts, not in scenes3x4; identity tags from >= 20 solo posts, revealing outfit tags removed by datagen/clean_tags_v2.py) x 3 groups x (4 scenes + 2 body poses); artists >= 300 posts (6,231), a fresh artist combo per group. Same scene, framing, pose and rating rules as scenes3x4."
+}

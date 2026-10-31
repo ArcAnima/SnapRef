@@ -6,13 +6,23 @@ K/V in self-attention, with the target LoRA, inside ComfyUI's own blocks, so any
 The target LoRA is on in every target forward. By default only the positive (cond) branch reads the reference.
 
 strength: a log-scale bias on the attention logits of the reference keys (0 = trained weight; > 0 stronger,
-< 0 weaker), applied as an additive attention mask; non-zero values make sampling about 1.3x slower.
+< 0 weaker). weight_1..3: per-reference attention weights (log w added to that reference's keys).
+Both are applied without an attention mask: the keys are split into groups (target + weight-1 references, and each
+other reference), each group runs the fused attention kernel with its log-sum-exp, and the groups are merged as
+softmax over all keys would (out = sum_g w_g e^lse_g o_g / sum_g w_g e^lse_g). Same result as the masked form, at
+about the speed of plain attention; falls back to the masked SDPA where the fused kernels are unavailable.
 
 ref_guidance (switch ref_guidance_on): the reference goes into both CFG branches and a post-CFG step adds
 (ref_guidance - 1) * (uncond with reference - uncond without reference), then APG (as in ElectronGirl's
 ComfyUI-Anima-Ref-Adapter, Apache-2.0). One extra model call per step until ref_end.
 
 Two characters: stitch two references side by side into one image and say who is left / right in the prompt.
+
+Several references of ONE character (e.g. an upper-body shot and a full-body shot): connect image_2 / image_3 or
+pass an image batch with use_batch on. Each reference is encoded on its own and the per-block K/V are concatenated,
+so the target reads all of them (tested with v1a on 96 unseen characters: closer to the character than any single
+reference, never two people; reports/2026-10-31_multi-ref-same-character). multi_layout "stitch" puts them side by
+side in one ~ref_megapixels reference instead (what Image Stitch does).
 
 Node: SnapRef (MODEL, CLIP, VAE, reference IMAGE, adapter) -> MODEL for KSampler.
 Weight files keep the internal tensor format anima_ref_kv/1 (key prefix anima_ref_kv.*).
@@ -21,6 +31,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 
 import torch
 import torch.nn.functional as F
@@ -101,8 +112,8 @@ class _Adapter:
                 q, k, v = _attn.compute_qkv(x, context, rope_emb=rope_emb, transformer_options=transformer_options)
                 if "record" in state:
                     state["record"][_i] = (k, v)
-                elif state.get("bias", 0.0) != 0.0:
-                    out = _biased_attention(q, k, state["cache"][_i], v, state["bias"], _attn.n_heads)
+                elif any(b != 0.0 for b in state.get("biases", ())):
+                    out = _weighted_attention(q, k, v, state["cache"][_i], state["sizes"], state["biases"])
                     return _attn.output_dropout(_attn.output_proj(out))
                 else:
                     k_r, v_r = state["cache"][_i]
@@ -117,20 +128,61 @@ def _set_attn_state(dm, state) -> None:
         block.self_attn._ref_kv_state = state
 
 
-def _biased_attention(q, k_t, kv_ref, v_t, bias: float, heads: int):
-    """softmax over [K_ref + bias ; K_t]: SDPA with an additive key mask (broadcast, not materialised).
-    Keys are padded to a multiple of 16 (masked out) so the memory-efficient kernel applies.
-    q, k, v [B, S, H, D] -> [B, S, H * D]."""
+def _lse_attention(q, k, v):
+    """Fused attention with its log-sum-exp. q, k, v [B, H, S, D] -> out [B, H, S, D] (float32), lse [B, H, S, 1]."""
+    if not (q.is_cuda and q.dtype in (torch.float16, torch.bfloat16)):
+        raise RuntimeError("no fused kernel")
+    try:
+        out, lse = torch.ops.aten._scaled_dot_product_flash_attention(q, k, v, 0.0, False, False)[:2]
+    except (RuntimeError, AttributeError):
+        out, lse = torch.ops.aten._scaled_dot_product_efficient_attention(q, k, v, None, True, 0.0, False)[:2]
+    return out.float(), lse.float()[..., :q.shape[2], None]
+
+
+def _weighted_attention(q, k_t, v_t, kv_ref, sizes, biases):
+    """softmax over [K_ref_1 + b_1; ...; K_ref_n + b_n; K_t] without materialising a mask: the target keys plus the
+    references with b = 0 form one group, every other reference its own group; each group goes through the fused
+    kernel, then the groups are merged by their log-sum-exp. q, k_t, v_t [B, S, H, D]; kv_ref the concatenated
+    reference (k, v) [1, sum(sizes), H, D]. Returns [B, S, H * D]."""
+    k_r, v_r = kv_ref
+    B, S, H, D = q.shape
+    kr = k_r.expand(B, *k_r.shape[1:]).to(q.dtype)
+    vr = v_r.expand(B, *v_r.shape[1:]).to(q.dtype)
+    starts = [sum(sizes[:i]) for i in range(len(sizes))]
+    span = lambda t, i: t[:, starts[i]:starts[i] + sizes[i]]   # noqa: E731
+    zero = [i for i, b in enumerate(biases) if b == 0.0]
+    groups = [(0.0, torch.cat([span(kr, i) for i in zero] + [k_t], dim=1), torch.cat([span(vr, i) for i in zero] + [v_t], dim=1))]
+    groups += [(biases[i], span(kr, i), span(vr, i)) for i in range(len(sizes)) if biases[i] != 0.0]
+    qh = q.transpose(1, 2)
+    try:
+        parts = [(b, *_lse_attention(qh, kk.transpose(1, 2), vv.transpose(1, 2))) for b, kk, vv in groups]
+    except RuntimeError:   # CPU / fp32 / no fused kernel: one masked SDPA over all keys
+        return _masked_attention(q, k_t, v_t, kv_ref, sizes, biases)
+    m = torch.stack([lse + b for b, _, lse in parts]).amax(dim=0)
+    num, den = 0.0, 0.0
+    for b, out, lse in parts:
+        w = torch.exp(lse + b - m)
+        num = num + w * out
+        den = den + w
+    out = (num / den).to(q.dtype)
+    return out.transpose(1, 2).reshape(B, S, H * D)
+
+
+def _masked_attention(q, k_t, v_t, kv_ref, sizes, biases):
+    """Reference implementation (and fallback) of _weighted_attention: SDPA with an additive key mask."""
     k_r, v_r = kv_ref
     B, S, H, D = q.shape
     k = torch.cat([k_r.expand(B, *k_r.shape[1:]).to(q.dtype), k_t], dim=1).transpose(1, 2)
     v = torch.cat([v_r.expand(B, *v_r.shape[1:]).to(q.dtype), v_t], dim=1).transpose(1, 2)
-    n, r = k.shape[2], k_r.shape[1]
+    n = k.shape[2]
     pad = (-n) % 16
     if pad:
         k, v = F.pad(k, (0, 0, 0, pad)), F.pad(v, (0, 0, 0, pad))
     mask = torch.zeros(1, 1, 1, n + pad, device=q.device, dtype=q.dtype)
-    mask[..., :r] = bias
+    start = 0
+    for size, bias in zip(sizes, biases):
+        mask[..., start:start + size] = bias
+        start += size
     if pad:
         mask[..., n:] = float("-inf")
     out = F.scaled_dot_product_attention(q.transpose(1, 2), k, v, attn_mask=mask.expand(B, H, S, n + pad))
@@ -177,22 +229,33 @@ def _encode_reference(adapter: _Adapter, dm, ref, context, target_hw, mode: str)
     return record
 
 
-def _make_wrapper(adapter: _Adapter, ref_latent, ref_cond, mode: str, in_uncond: bool, bias: float = 0.0):
+def _concat_kv(records: list[list]) -> list:
+    if len(records) == 1:
+        return records[0]
+    return [(torch.cat([r[i][0] for r in records], dim=1), torch.cat([r[i][1] for r in records], dim=1))
+            for i in range(len(records[0]))]
+
+
+def _make_wrapper(adapter: _Adapter, ref_latents: list, ref_cond, mode: str, in_uncond: bool, bias: float = 0.0,
+                  weights: list | None = None):
+    weights = list(weights or [1.0] * len(ref_latents))
+    biases = [bias + math.log(w) for w in weights]   # weight-0 references were dropped before encoding
     def wrapper(executor, x, timesteps, context, fps=None, padding_mask=None, **kwargs):
         dm = executor.class_obj
         adapter.install(dm)
         options = kwargs.get("transformer_options", {})
         key = (id(dm), tuple(x.shape[-2:]), x.dtype, x.device)
         if key not in adapter.cache:
-            adapter.cache.clear()   # ~0.9 GB of K/V per 1 MP reference (bf16); keep one
+            adapter.cache.clear()   # ~0.9 GB of K/V per 1 MP reference (bf16); keep one set
             cross, meta = ref_cond
             ids, weights = meta.get("t5xxl_ids"), meta.get("t5xxl_weights")
             ctx = dm.preprocess_text_embeds(cross.to(x.device, x.dtype),
                                             None if ids is None else ids.unsqueeze(0).to(x.device),
                                             None if weights is None else weights.unsqueeze(0).unsqueeze(-1).to(x.device, x.dtype))
-            adapter.cache[key] = _encode_reference(adapter, dm, ref_latent.to(x.device, x.dtype), ctx,
-                                                   tuple(x.shape[-2:]), mode)
-        cache = adapter.cache[key]
+            records = [_encode_reference(adapter, dm, lat.to(x.device, x.dtype), ctx, tuple(x.shape[-2:]), mode)
+                       for lat in ref_latents]
+            adapter.cache[key] = (_concat_kv(records), [r[0][0].shape[1] for r in records])
+        cache, sizes = adapter.cache[key]
         flags = options.get("cond_or_uncond") or [0]
         if options.get(NO_REF_KEY):   # the extra reference-free call of ref_guidance
             use = [False] * len(flags)
@@ -201,7 +264,7 @@ def _make_wrapper(adapter: _Adapter, ref_latent, ref_cond, mode: str, in_uncond:
 
         def run(xs, ts, cs, with_ref, kw):
             # the "tgt" LoRA is on in every target forward, with or without the reference (as in training)
-            _set_attn_state(dm, {"cache": cache, "bias": bias} if with_ref else None)
+            _set_attn_state(dm, {"cache": cache, "sizes": sizes, "biases": biases} if with_ref else None)
             _STATE.update(adapter=adapter, stream="tgt")
             try:
                 return executor(xs, ts, cs, fps, padding_mask, **kw)
@@ -268,6 +331,46 @@ def _make_ref_guidance(ref_guidance: float, correction: str, ref_end: float):
     return post_cfg
 
 
+def _reference_images(inputs: list, use_batch: bool, weights: list) -> tuple[list, list]:
+    """IMAGE tensors [B, H, W, C] -> single images [1, H, W, C] (first of each batch unless use_batch) and the
+    weight of each (a batch shares its input's weight). Images with weight 0 are dropped (no encoding cost)."""
+    out, ws = [], []
+    for img, w in zip(inputs, weights):
+        if img is None or w <= 0:
+            continue
+        for i in range(img.shape[0] if use_batch else 1):
+            out.append(img[i:i + 1])
+            ws.append(float(w))
+    if not out:
+        raise ValueError("SnapRef: every reference has weight 0")
+    return out, ws
+
+
+def _stitch(refs: list) -> torch.Tensor:
+    """Side by side at the first image's height on white (core Image Stitch, direction right, match size)."""
+    h = refs[0].shape[1]
+    parts = []
+    for px in refs:
+        c = px[..., :3].movedim(-1, 1)
+        w = max(1, round(c.shape[-1] * h / c.shape[-2]))
+        parts.append(comfy.utils.common_upscale(c, w, h, "lanczos", "disabled").movedim(1, -1))
+    return torch.cat(parts, dim=2)
+
+
+def _encode_image(model, vae, image, megapixels: float):
+    """One reference image [1, H, W, C] -> model-space latent [1, 16, 1, h, w], shrunk (never enlarged) to
+    megapixels with the aspect kept, sides multiples of 16."""
+    pixels = image[:1].movedim(-1, 1)
+    h, w = pixels.shape[-2:]
+    s = min(1.0, (megapixels * 1024 * 1024 / (w * h)) ** 0.5)
+    width, height = max(16, int(w * s) // 16 * 16), max(16, int(h * s) // 16 * 16)
+    pixels = comfy.utils.common_upscale(pixels, width, height, "lanczos", "disabled").movedim(1, -1)
+    latent = vae.encode(pixels[..., :3])
+    if latent.ndim == 4:
+        latent = latent.unsqueeze(2)
+    return model.get_model_object("process_latent_in")(latent), (width, height)
+
+
 def _adapter_files():
     names = folder_paths.get_filename_list("loras")
     return [n for n in names if "snapref" in n.lower() or "anima_ref_kv" in n] or names
@@ -305,6 +408,21 @@ class SnapRef:
             "correction": (["apg", "rescale", "none"], {"tooltip": "keeps colors in check when ref_guidance is on"}),
             "ref_end": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01,
                                   "tooltip": "last step with the extra call, as a fraction of the denoising; ~0.6 is faster"}),
+            "image_2": ("IMAGE", {"tooltip": "another reference of the SAME character (e.g. full body when image is an "
+                                             "upper-body shot). For two different characters, stitch them into image instead"}),
+            "image_3": ("IMAGE", {"tooltip": "a third reference of the same character"}),
+            "use_batch": ("BOOLEAN", {"default": False, "tooltip": "use every image of each IMAGE batch as a reference of "
+                                      "the same character (off: only the first image of each input)"}),
+            "multi_layout": (["separate", "stitch"], {"tooltip": "several references: separate = each at ref_megapixels, "
+                             "encoded on its own (sharper, slower with more references); stitch = side by side in one "
+                             "ref_megapixels image (as Image Stitch, same speed as one reference)"}),
+            "weight_1": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05,
+                                   "tooltip": "how much image (the first reference) counts; 1 = as trained. Only with "
+                                              "several references in multi_layout separate. No speed cost"}),
+            "weight_2": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05,
+                                   "tooltip": "how much image_2 counts (e.g. 0.4: mostly the first image, a little of this "
+                                              "one); 0 = ignored"}),
+            "weight_3": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05, "tooltip": "how much image_3 counts"}),
         }}
 
     RETURN_TYPES = ("MODEL",)
@@ -312,31 +430,33 @@ class SnapRef:
     CATEGORY = "SnapRef"
 
     def apply(self, model, clip, vae, image, adapter, mode, ref_in_uncond, ref_megapixels, strength=0.0, ref_caption="",
-              ref_guidance_on=False, ref_guidance=4.5, correction="apg", ref_end=1.0):
+              ref_guidance_on=False, ref_guidance=4.5, correction="apg", ref_end=1.0, image_2=None, image_3=None,
+              use_batch=False, multi_layout="separate", weight_1=1.0, weight_2=1.0, weight_3=1.0):
         path = folder_paths.get_full_path_or_raise("loras", adapter)
         if path not in _adapters:
             _adapters[path] = _Adapter(path)
         ad = _adapters[path]
-        pixels = image[:1].movedim(-1, 1)
-        h, w = pixels.shape[-2:]
-        s = min(1.0, (ref_megapixels * 1024 * 1024 / (w * h)) ** 0.5)
-        width, height = max(16, int(w * s) // 16 * 16), max(16, int(h * s) // 16 * 16)
-        pixels = comfy.utils.common_upscale(pixels, width, height, "lanczos", "disabled").movedim(1, -1)
-        latent = vae.encode(pixels[..., :3])
-        if latent.ndim == 4:
-            latent = latent.unsqueeze(2)
-        latent = model.get_model_object("process_latent_in")(latent)
+        refs, weights = _reference_images([image, image_2, image_3], use_batch, [weight_1, weight_2, weight_3])
+        if len(refs) > 1 and multi_layout == "stitch":
+            refs, weights = [_stitch(refs)], [1.0]
+        latents, sizes = [], []
+        for px in refs:
+            lat, size = _encode_image(model, vae, px, ref_megapixels)
+            latents.append(lat)
+            sizes.append(size)
+        width, height = sizes[0]
         cond = clip.encode_from_tokens_scheduled(clip.tokenize(ref_caption.strip()))[0]
         m = model.clone()
         m.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, WRAPPER_KEY,
-                               _make_wrapper(ad, latent, cond, mode, ref_in_uncond or ref_guidance_on, strength))
+                               _make_wrapper(ad, latents, cond, mode, ref_in_uncond or ref_guidance_on, strength, weights))
         # outermost: a wrapper that runs the blocks itself without calling executor (Anzhc Mod Guidance) would skip ours
         dm_wrappers = m.wrappers[comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL]
         m.wrappers[comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL] = {WRAPPER_KEY: dm_wrappers.pop(WRAPPER_KEY), **dm_wrappers}
         m.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.OUTER_SAMPLE, WRAPPER_KEY, _make_outer(ad))
         if ref_guidance_on:
             m.set_model_sampler_post_cfg_function(_make_ref_guidance(ref_guidance, correction, ref_end))
-        logging.info(f"[SnapRef] {adapter} step {ad.meta.get('step')}, reference {width}x{height}, mode {mode}, "
+        logging.info(f"[SnapRef] {adapter} step {ad.meta.get('step')}, "
+                     f"reference {', '.join(f'{a}x{b} w{w:g}' for (a, b), w in zip(sizes, weights))}, mode {mode}, "
                      f"strength {strength}, ref_guidance {ref_guidance if ref_guidance_on else 'off'}")
         return (m,)
 
