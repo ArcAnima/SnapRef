@@ -74,16 +74,28 @@ works with all of them.
    | [`snapref_v1b.safetensors`](https://huggingface.co/0ppxnhximxr/snapref-v1b) | twice the LoRA rank of v1a |
 
    Each also comes as an FP8 file (half the size).
-4. Open a workflow from the same Hugging Face page (`workflows/`), load a reference image and queue.
+4. Open the `*_simple.json` workflow from the same Hugging Face page (`workflows/`), click the picture slot in the
+   **SnapRef** node and queue.
 
 ```text
 masterpiece, best quality, score_7, safe, 1girl, solo, full body, sitting, crossed legs, bench, street, night
 ```
 
 > [!NOTE]
-> SnapRef is not a regular LoRA. Load it with the **SnapRef** node, not with LoraLoader.
-> The basic settings are explained in the [v1a model card](https://huggingface.co/0ppxnhximxr/snapref-v1a#settings);
-> the inputs added for v2a are below.
+> SnapRef is not a regular LoRA. Load it with a SnapRef node, not with LoraLoader.
+
+**Two nodes.**
+
+| node | for | inputs |
+|---|---|---|
+| **SnapRef** | everyone | one or two pictures picked inside the node (click or drop), Mode (*Character & Style* / *Character*), Strength per picture, Fidelity |
+| **SnapRef (Advanced)** | full control | every setting (below and in the [v1a model card](https://huggingface.co/0ppxnhximxr/snapref-v1a#settings)); saved workflows open on it unchanged |
+
+On the simple node, **Strength** is how much a picture counts (1 = as trained, 0 = off, 2 = twice) and
+**Fidelity** trades detail for prompt freedom (1 = every detail of the picture; lower also lets the negative
+prompt branch read the picture, so the prompt is followed more freely, about 12 % slower).
+
+Inputs of SnapRef (Advanced) added for v2a:
 
 | new node input | default | |
 |---|---|---|
@@ -191,7 +203,7 @@ python train/train_asym.py --prep v2_mix_prep --config configs/train_v2a.json --
 | `train/prepare_asym.py`, `train/train_asym.py` | tensor preparation and training |
 | `train/eval_asym.py`, `train/compare_refs.py`, `train/score_panels.py` | held-out loss gaps, side-by-side runs against other adapters, embedding scores |
 | `train/anima_env.py`, `train/sample.py`, `train/preview.py`, `train/prepare*.py` | model plumbing on top of ComfyUI, sampling, in-training previews, shared data helpers |
-| `comfyui_nodes/snapref/` | the ComfyUI node (bf16 and FP8; multi-reference, reference weights) |
+| `comfyui_nodes/snapref/` | the ComfyUI nodes: SnapRef (simple, `simple.py` + `web/snapref.js`) and SnapRef (Advanced) |
 | `train/detail_eval/` | detail evaluation: frozen set, renders, tag / head-crop features, paired CIs, watcher |
 | `train/multiref_test.py`, `train/ccip_eval.py` | multi-reference test, CCIP identity scores |
 | `datagen/select_v2_images.py`, `datagen/build_pairs_v2.py`, `train/D_build_v2_prep.py`, `train/D_merge_preps.py` | v2a data: Danbooru selection (tags only), training pairs, prep, merge with the generated prep |
@@ -230,6 +242,8 @@ Data generation and training of v1a alone took about 120 H100 GPU-hours.
   `ref_in_uncond` or `ref_guidance_on` avoids it.
 - **SageAttention:** with `strength` or reference weights ≠ 1, the reference part uses PyTorch's fused attention,
   so a GPU where Sage is much faster can be slightly slower there.
+- **Reference cache:** the reference is encoded once and kept between runs while the picture and settings stay the
+  same (about 0.9 GB of VRAM for a 1 MP picture); "Free model and node cache" in ComfyUI releases it.
 
 ## Known limitations
 

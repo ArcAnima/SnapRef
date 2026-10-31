@@ -29,6 +29,7 @@ Weight files keep the internal tensor format anima_ref_kv/1 (key prefix anima_re
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
@@ -44,9 +45,34 @@ import comfy.utils
 import folder_paths
 
 WRAPPER_KEY = "snapref"
+
 NO_REF_KEY = "snapref_off"   # transformer_options flag: run this call without the reference
 _STATE = {"adapter": None, "stream": None}   # LoRA hooks apply only while an adapter is active
 _adapters: dict[str, "_Adapter"] = {}
+
+
+def _drop_reference_caches() -> None:
+    for ad in _adapters.values():
+        ad.cache.clear()
+
+
+def _hook_memory_release() -> None:
+    """Clear the cross-run reference cache together with ComfyUI's own unload / free paths."""
+    import comfy.model_management as mm
+    for name in ("unload_all_models", "soft_empty_cache"):
+        orig = getattr(mm, name, None)
+        if orig is None or getattr(orig, "_snapref_hooked", False):
+            continue
+
+        def wrapped(*a, _orig=orig, _name=name, **k):
+            if _name == "unload_all_models" or k.get("force") or (a and a[0]):
+                _drop_reference_caches()
+            return _orig(*a, **k)
+        wrapped._snapref_hooked = True
+        setattr(mm, name, wrapped)
+
+
+_hook_memory_release()
 
 
 class _Adapter:
@@ -112,6 +138,13 @@ class _Adapter:
                 q, k, v = _attn.compute_qkv(x, context, rope_emb=rope_emb, transformer_options=transformer_options)
                 if "record" in state:
                     state["record"][_i] = (k, v)
+                elif state.get("rows") is not None:   # mixed batch: reference only for the rows in state["rows"]
+                    out = _rows_attention(q, k, v, state["cache"][_i], state["sizes"], state["biases"], state["rows"],
+                                          state.get("row_biases"))
+                    if out is not None:
+                        return _attn.output_dropout(_attn.output_proj(out))
+                    out = _weighted_attention(q, k, v, state["cache"][_i], state["sizes"], state["biases"])   # no fused kernel
+                    return _attn.output_dropout(_attn.output_proj(out))
                 elif any(b != 0.0 for b in state.get("biases", ())):
                     out = _weighted_attention(q, k, v, state["cache"][_i], state["sizes"], state["biases"])
                     return _attn.output_dropout(_attn.output_proj(out))
@@ -166,6 +199,39 @@ def _weighted_attention(q, k_t, v_t, kv_ref, sizes, biases):
         den = den + w
     out = (num / den).to(q.dtype)
     return out.transpose(1, 2).reshape(B, S, H * D)
+
+
+def _rows_attention(q, k_t, v_t, kv_ref, sizes, biases, rows, row_biases=None):
+    """One call for a batch where only some rows read the reference (cond reads it, uncond does not): plain
+    attention over the target keys for every row, plus the reference groups merged by log-sum-exp into the rows
+    that read them. Rows without the reference get exactly the plain attention. row_biases: optional extra log bias
+    per selected row, added to every reference group of that row (Fidelity: uncond rows at log(1 - f))."""
+    B, S, H, D = q.shape
+    qh, kt, vt = q.transpose(1, 2), k_t.transpose(1, 2), v_t.transpose(1, 2)
+    try:
+        out_t, lse_t = _lse_attention(qh, kt, vt)
+    except RuntimeError:   # no fused kernel: fall back to the split path (two calls)
+        return None
+    sel = torch.as_tensor(rows, device=q.device)
+    k_r, v_r = kv_ref
+    starts = [sum(sizes[:i]) for i in range(len(sizes))]
+    qs = qh.index_select(0, sel)
+    parts = [(0.0, out_t.index_select(0, sel), lse_t.index_select(0, sel))]
+    for i, b in enumerate(biases):
+        kr = k_r[:, starts[i]:starts[i] + sizes[i]].expand(len(rows), -1, -1, -1).to(q.dtype).transpose(1, 2)
+        vr = v_r[:, starts[i]:starts[i] + sizes[i]].expand(len(rows), -1, -1, -1).to(q.dtype).transpose(1, 2)
+        parts.append((b, *_lse_attention(qs, kr, vr)))
+    if row_biases is not None:
+        extra = torch.as_tensor(row_biases, device=q.device, dtype=torch.float32).view(-1, 1, 1, 1)
+        parts = [parts[0]] + [(b + extra, o, lse) for b, o, lse in parts[1:]]   # target group stays at 0
+    m = torch.stack([(lse + b).expand_as(parts[0][2]) for b, _, lse in parts]).amax(dim=0)
+    num, den = 0.0, 0.0
+    for b, o, lse in parts:
+        w = torch.exp(lse + b - m)
+        num, den = num + w * o, den + w
+    out = out_t.clone()
+    out.index_copy_(0, sel, num / den)
+    return out.to(q.dtype).transpose(1, 2).reshape(B, S, H * D)
 
 
 def _masked_attention(q, k_t, v_t, kv_ref, sizes, biases):
@@ -236,15 +302,29 @@ def _concat_kv(records: list[list]) -> list:
             for i in range(len(records[0]))]
 
 
+def _ref_digest(ref_latents: list, ref_cond, mode: str) -> str:
+    """Content key of a reference set: same pictures + caption + mode -> same K/V."""
+    h = hashlib.sha1(mode.encode())
+    for lat in ref_latents:
+        t = lat.detach().float().cpu().contiguous()
+        h.update(str(tuple(t.shape)).encode()); h.update(t.numpy().tobytes())
+    cross = ref_cond[0].detach().float().cpu().contiguous()
+    h.update(str(tuple(cross.shape)).encode()); h.update(cross.numpy().tobytes())
+    return h.hexdigest()
+
+
 def _make_wrapper(adapter: _Adapter, ref_latents: list, ref_cond, mode: str, in_uncond: bool, bias: float = 0.0,
-                  weights: list | None = None):
+                  weights: list | None = None, uncond_bias: float | None = None):
+    """uncond_bias (simple node, Fidelity < 1): the negative branch also reads the reference with this extra log
+    bias. Needs the one-call mixed path (CUDA, fp16/bf16); elsewhere the negative branch reads it fully."""
     weights = list(weights or [1.0] * len(ref_latents))
+    digest = _ref_digest(ref_latents, ref_cond, mode)
     biases = [bias + math.log(w) for w in weights]   # weight-0 references were dropped before encoding
     def wrapper(executor, x, timesteps, context, fps=None, padding_mask=None, **kwargs):
         dm = executor.class_obj
         adapter.install(dm)
         options = kwargs.get("transformer_options", {})
-        key = (id(dm), tuple(x.shape[-2:]), x.dtype, x.device)
+        key = (digest, id(dm), tuple(x.shape[-2:]), x.dtype, x.device)
         if key not in adapter.cache:
             adapter.cache.clear()   # ~0.9 GB of K/V per 1 MP reference (bf16); keep one set
             cross, meta = ref_cond
@@ -271,11 +351,26 @@ def _make_wrapper(adapter: _Adapter, ref_latents: list, ref_cond, mode: str, in_
             finally:
                 _set_attn_state(dm, None)
                 _STATE.update(adapter=None, stream=None)
+        n = x.shape[0] // len(flags)
+        if uncond_bias is not None and not options.get(NO_REF_KEY) and any(f == 1 for f in flags) \
+                and x.is_cuda and x.dtype in (torch.float16, torch.bfloat16):
+            # Fidelity: every row reads the reference, the uncond rows weaker (one call)
+            rows = list(range(x.shape[0]))
+            row_biases = [uncond_bias if flags[r // n] == 1 else 0.0 for r in rows]
+            _set_attn_state(dm, {"cache": cache, "sizes": sizes, "biases": biases, "rows": rows, "row_biases": row_biases})
+            _STATE.update(adapter=adapter, stream="tgt")
+            try:
+                return executor(x, timesteps, context, fps, padding_mask, **kwargs)
+            finally:
+                _set_attn_state(dm, None)
+                _STATE.update(adapter=None, stream=None)
+        if uncond_bias is not None:
+            use = [True] * len(flags)   # no fused kernel: the negative branch reads the reference fully
         if all(use) or not any(use):
             return run(x, timesteps, context, use[0], kwargs)
-        # mixed cond/uncond batch: run the two parts separately (same token count, no extra compute)
+        # mixed cond/uncond batch (rare for Anima: ComfyUI batches cond and uncond only when their text lengths match):
+        # run the two parts separately
         # shortcut: only x / timesteps / context are split; per-batch extras in kwargs (e.g. ControlNet) are not
-        n = x.shape[0] // len(flags)
         outs = []
         for i, u in enumerate(use):
             sl = slice(i * n, (i + 1) * n)
@@ -285,11 +380,10 @@ def _make_wrapper(adapter: _Adapter, ref_latents: list, ref_cond, mode: str, in_
 
 
 def _make_outer(adapter: _Adapter):
+    """Kept for workflows that carry it; the reference cache now lives across runs (content-keyed, one entry),
+    so a second image with the same reference skips the reference encoding."""
     def wrapper(executor, *args, **kwargs):
-        try:
-            return executor(*args, **kwargs)
-        finally:
-            adapter.cache.clear()
+        return executor(*args, **kwargs)
     return wrapper
 
 
@@ -461,5 +555,21 @@ class SnapRef:
         return (m,)
 
 
-NODE_CLASS_MAPPINGS = {"SnapRef": SnapRef}
-NODE_DISPLAY_NAME_MAPPINGS = {"SnapRef": "SnapRef"}
+try:   # package import inside ComfyUI; plain file import in tests
+    from . import simple as _simple   # noqa: E402
+except ImportError:
+    import importlib.util as _ilu
+    import os as _os
+    _spec = _ilu.spec_from_file_location("snapref_simple", _os.path.join(_os.path.dirname(__file__), "simple.py"))
+    _simple = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_simple)
+
+import types as _types   # noqa: E402
+
+# the simple node reaches the core through a namespace (works both as a package module and as a loose file)
+SnapRefSimple = _simple.make_simple_node(_types.SimpleNamespace(
+    _adapters=_adapters, _Adapter=_Adapter, _encode_image=_encode_image, _make_wrapper=_make_wrapper, WRAPPER_KEY=WRAPPER_KEY))
+WEB_DIRECTORY = "./web"
+# "SnapRef" keeps its class name so saved workflows still load; it is shown as SnapRef (Advanced)
+NODE_CLASS_MAPPINGS = {"SnapRefSimple": SnapRefSimple, "SnapRef": SnapRef}
+NODE_DISPLAY_NAME_MAPPINGS = {"SnapRefSimple": "SnapRef", "SnapRef": "SnapRef (Advanced)"}
