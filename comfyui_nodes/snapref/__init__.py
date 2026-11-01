@@ -315,7 +315,7 @@ def _ref_digest(ref_latents: list, ref_cond, mode: str) -> str:
 
 def _make_wrapper(adapter: _Adapter, ref_latents: list, ref_cond, mode: str, in_uncond: bool, bias: float = 0.0,
                   weights: list | None = None, uncond_bias: float | None = None):
-    """uncond_bias (simple node, Fidelity < 1): the negative branch also reads the reference with this extra log
+    """uncond_bias (Fidelity < 1): the negative branch also reads the reference with this extra log
     bias. Needs the one-call mixed path (CUDA, fp16/bf16); elsewhere the negative branch reads it fully."""
     weights = list(weights or [1.0] * len(ref_latents))
     digest = _ref_digest(ref_latents, ref_cond, mode)
@@ -517,6 +517,9 @@ class SnapRef:
                                    "tooltip": "how much image_2 counts (e.g. 0.4: mostly the first image, a little of this "
                                               "one); 0 = ignored"}),
             "weight_3": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05, "tooltip": "how much image_3 counts"}),
+            "fidelity": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                                   "tooltip": "1 = keep every detail of the picture; lower = follow the prompt more freely. "
+                                              "Ignored when ref_in_uncond or ref_guidance_on is on"}),
         }}
 
     RETURN_TYPES = ("MODEL",)
@@ -525,7 +528,7 @@ class SnapRef:
 
     def apply(self, model, clip, vae, image, adapter, mode, ref_in_uncond, ref_megapixels, strength=0.0, ref_caption="",
               ref_guidance_on=False, ref_guidance=4.5, correction="apg", ref_end=1.0, image_2=None, image_3=None,
-              use_batch=False, multi_layout="separate", weight_1=1.0, weight_2=1.0, weight_3=1.0):
+              use_batch=False, multi_layout="separate", weight_1=1.0, weight_2=1.0, weight_3=1.0, fidelity=1.0):
         path = folder_paths.get_full_path_or_raise("loras", adapter)
         if path not in _adapters:
             _adapters[path] = _Adapter(path)
@@ -540,9 +543,10 @@ class SnapRef:
             sizes.append(size)
         width, height = sizes[0]
         cond = clip.encode_from_tokens_scheduled(clip.tokenize(ref_caption.strip()))[0]
+        uncond_bias = None if fidelity >= 1.0 or ref_in_uncond or ref_guidance_on else math.log(max(1.0 - float(fidelity), 1e-6))
         m = model.clone()
         m.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, WRAPPER_KEY,
-                               _make_wrapper(ad, latents, cond, mode, ref_in_uncond or ref_guidance_on, strength, weights))
+                               _make_wrapper(ad, latents, cond, mode, ref_in_uncond or ref_guidance_on, strength, weights, uncond_bias))
         # outermost: a wrapper that runs the blocks itself without calling executor (Anzhc Mod Guidance) would skip ours
         dm_wrappers = m.wrappers[comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL]
         m.wrappers[comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL] = {WRAPPER_KEY: dm_wrappers.pop(WRAPPER_KEY), **dm_wrappers}
@@ -551,7 +555,7 @@ class SnapRef:
             m.set_model_sampler_post_cfg_function(_make_ref_guidance(ref_guidance, correction, ref_end))
         logging.info(f"[SnapRef] {adapter} step {ad.meta.get('step')}, "
                      f"reference {', '.join(f'{a}x{b} w{w:g}' for (a, b), w in zip(sizes, weights))}, mode {mode}, "
-                     f"strength {strength}, ref_guidance {ref_guidance if ref_guidance_on else 'off'}")
+                     f"strength {strength}, fidelity {fidelity}, ref_guidance {ref_guidance if ref_guidance_on else 'off'}")
         return (m,)
 
 

@@ -35,7 +35,7 @@ WIDGETS = {
     "KSampler": ["seed", "@control", "steps", "cfg", "sampler_name", "scheduler", "denoise"], "VAEDecode": [],
     "SaveImage": ["filename_prefix"],
     "SnapRef": ["adapter", "mode", "ref_in_uncond", "ref_megapixels", "strength", "ref_caption", "ref_guidance_on", "ref_guidance",
-                   "correction", "ref_end", "use_batch", "multi_layout", "weight_1", "weight_2", "weight_3"],
+                   "correction", "ref_end", "use_batch", "multi_layout", "weight_1", "weight_2", "weight_3", "fidelity"],
     "AnimaRefAdapter": ["lora_name", "ref_guidance", "correction", "strength", "ref_end", "ref_megapixels"],
     "AnimaRefAdapterLoader": ["lora_name", "strength", "ref_offset_h"],
     "AnimaRefLatent": ["width", "height", "fill"],
@@ -131,7 +131,7 @@ def ours_node(g, unet, clip, vae, ref, x, y, rg_on=False, extra_refs=()):
     return g.add("SnapRef", inputs,
                  {"adapter": OURS, "mode": "cs", "ref_in_uncond": False, "ref_megapixels": 1.0, "strength": 0.0, "ref_caption": "",
                   "ref_guidance_on": rg_on, "ref_guidance": 4.5, "correction": "apg", "ref_end": 1.0,
-                  "use_batch": False, "multi_layout": "separate", "weight_1": 1.0, "weight_2": 1.0, "weight_3": 1.0},
+                  "use_batch": False, "multi_layout": "separate", "weight_1": 1.0, "weight_2": 1.0, "weight_3": 1.0, "fidelity": 1.0},
                  pos=(x, y), title="SnapRef v1a")
 
 

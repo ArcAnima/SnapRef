@@ -95,6 +95,9 @@ On the simple node, **Strength** is how much a picture counts (1 = as trained, 0
 **Fidelity** trades detail for prompt freedom (1 = every detail of the picture; lower also lets the negative
 prompt branch read the picture, so the prompt is followed more freely, about 12 % slower).
 
+**Fidelity** is also available on the advanced node (0–1, default 1). It is ignored when
+`ref_in_uncond` or `ref_guidance_on` is on. It is appended after the existing inputs to preserve saved workflows.
+
 Inputs of SnapRef (Advanced) added for v2a:
 
 | new node input | default | |
