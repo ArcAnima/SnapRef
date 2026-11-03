@@ -109,6 +109,21 @@ Inputs of SnapRef (Advanced) added for v2a:
 
 The new inputs sit at the end of the node, so saved v1 workflows open unchanged.
 
+## Anima-2.9B block routing
+
+Both SnapRef nodes automatically recognize a 28-block adapter on Anima-2.9B's known
+40-block depth expansion. Adapter hooks follow the original layers at
+`0, 1, 3, 4, 6, 7, 9, 10, 12, 13, 15, 16, 18, 19, 20, 22, 23, 25, 26, 28, 29, 31, 32, 34, 35, 37, 38, 39`.
+The inserted layers keep their own weights, and reference K/V caches retain all 40
+actual layer positions. Native layouts keep their original routing. Other block-count
+mismatches raise an error before generation rather than silently using the wrong layers.
+No extra node or setting is needed.
+
+This corrects weight routing; it does not establish reference quality on 2.9B or its
+finetunes, since the adapters were trained on Anima base v1.0. CPU hook and reference-cache
+regressions can be run with `python -m unittest discover -s tests -p 'test_block_layout.py'`
+(PyTorch required, no ComfyUI or checkpoints).
+
 ## v2a preview
 
 Two checkpoints of the v2a run, released as previews: **v2a-pre1** (step 10,000) and **v2a-pre2** (step 15,000).
