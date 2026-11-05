@@ -29,6 +29,7 @@
 </p>
 
 <p align="center">
+  <a href="https://civitai.com/models/3028191/snapref">Civitai</a> ·
   <a href="#quick-start">Quick start</a> ·
   <a href="#v2a-preview">v2a preview</a> ·
   <a href="#results-v1a">Results</a> ·
