@@ -120,9 +120,9 @@ mismatches raise an error before generation rather than silently using the wrong
 No extra node or setting is needed.
 
 This corrects weight routing; it does not establish reference quality on 2.9B or its
-finetunes, since the adapters were trained on Anima base v1.0. CPU hook and reference-cache
-regressions can be run with `python -m unittest discover -s tests -p 'test_block_layout.py'`
-(PyTorch required, no ComfyUI or checkpoints).
+finetunes, since the adapters were trained on Anima base v1.0. CPU hook, reference-cache,
+and model-reload regressions can be run with `python -m unittest discover -s tests -v`
+(PyTorch and safetensors required, no ComfyUI or checkpoints).
 
 ## v2a preview
 

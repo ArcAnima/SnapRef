@@ -33,6 +33,8 @@ import hashlib
 import json
 import logging
 import math
+import uuid
+import weakref
 
 import torch
 import torch.nn.functional as F
@@ -114,7 +116,7 @@ class _Adapter:
             alpha = float(tensors[root + "alpha"])
             self.lora.setdefault(name, {})[stream] = [down, up, alpha / down.shape[0]]
         self.block_indices = {int(n.split(".")[1]) for n in self.lora if n.startswith("blocks.")}
-        self.hooked: set[int] = set()   # id() of diffusion models carrying our hooks
+        self.hooked = weakref.WeakSet()   # diffusion models carrying our hooks (id() is reused after unload)
         self.cache: dict = {}
 
     @staticmethod
@@ -129,7 +131,7 @@ class _Adapter:
         """Forward hooks on the targeted Linears (LoRA delta of the active stream) and the self-attention
         record / prepend patch. Both are no-ops unless this adapter is active."""
         block_map = _adapter_block_map(self.block_indices, dm)
-        if id(dm) in self.hooked:
+        if dm in self.hooked:
             return
         # Resolve everything first; a failed install must not be remembered as successful.
         targets = []
@@ -180,7 +182,7 @@ class _Adapter:
                     v = torch.cat([v_r.expand(v.shape[0], *v_r.shape[1:]).to(v.dtype), v], dim=1)
                 return _attn.compute_attention(q, k, v, transformer_options=transformer_options)
             attn.forward = forward
-        self.hooked.add(id(dm))
+        self.hooked.add(dm)
 
 
 def _set_attn_state(dm, state) -> None:
@@ -329,6 +331,15 @@ def _concat_kv(records: list[list]) -> list:
             for i in range(len(records[0]))]
 
 
+def _model_token(dm) -> str:
+    """Cache key for this model object (id() is reused after unload)."""
+    token = getattr(dm, "_snapref_token", None)
+    if token is None:
+        token = uuid.uuid4().hex
+        dm._snapref_token = token
+    return token
+
+
 def _ref_digest(ref_latents: list, ref_cond, mode: str) -> str:
     """Content key of a reference set: same pictures + caption + mode -> same K/V."""
     h = hashlib.sha1(mode.encode())
@@ -351,7 +362,7 @@ def _make_wrapper(adapter: _Adapter, ref_latents: list, ref_cond, mode: str, in_
         dm = executor.class_obj
         adapter.install(dm)
         options = kwargs.get("transformer_options", {})
-        key = (digest, id(dm), tuple(x.shape[-2:]), x.dtype, x.device)
+        key = (digest, _model_token(dm), tuple(x.shape[-2:]), x.dtype, x.device)
         if key not in adapter.cache:
             adapter.cache.clear()   # ~0.9 GB of K/V per 1 MP reference (bf16); keep one set
             cross, meta = ref_cond
