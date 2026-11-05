@@ -89,8 +89,12 @@ masterpiece, best quality, score_7, safe, 1girl, solo, full body, sitting, cross
 
 | node | for | inputs |
 |---|---|---|
-| **SnapRef** | everyone | one or two pictures picked inside the node (click or drop), Mode (*Character & Style* / *Character*), Strength per picture, Fidelity |
+| **SnapRef** | everyone | up to eight pictures picked inside the node (click or drop), Mode (*Character & Style* / *Character*), Strength per picture, Fidelity |
 | **SnapRef (Advanced)** | full control | every setting (below and in the [v1a model card](https://huggingface.co/0ppxnhximxr/snapref-v1a#settings)); saved workflows open on it unchanged |
+
+After filling two pictures, click the square **+** button to the right of **Character** to add another
+reference slot (up to eight pictures of the same character). Each picture has its own Strength; Fidelity
+applies to all references. Existing one- and two-picture workflows remain compatible.
 
 On the simple node, **Strength** is how much a picture counts (1 = as trained, 0 = off, 2 = twice) and
 **Fidelity** trades detail for prompt freedom (1 = every detail of the picture; lower also lets the negative
