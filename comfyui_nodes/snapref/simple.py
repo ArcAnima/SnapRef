@@ -1,4 +1,4 @@
-"""SnapRef (simple node): one or two pictures of a character picked inside the node, Mode, Strength, Fidelity.
+"""SnapRef (simple node): up to eight pictures of a character, Mode, Strength, Fidelity.
 Everything else at the trained defaults; the full set of inputs is on SnapRef (Advanced) in __init__.py."""
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ import folder_paths
 
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".avif")
 MODES = {"Character & Style": "cs", "Character": "char"}
+MAX_REFERENCES = 8
 
 
 def input_images() -> list[str]:
@@ -52,7 +53,7 @@ def make_simple_node(core):
         @classmethod
         def INPUT_TYPES(cls):
             images = input_images()
-            return {"required": {
+            inputs = {"required": {
                 "model": ("MODEL",),
                 "clip": ("CLIP",),
                 "vae": ("VAE",),
@@ -71,16 +72,20 @@ def make_simple_node(core):
                 "strength_2": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05,
                                          "tooltip": "how much the second picture counts"}),
             }}
+            for i in range(3, MAX_REFERENCES + 1):
+                inputs["optional"][f"reference_{i}"] = (["none"] + images, {"default": "none"})
+                inputs["optional"][f"strength_{i}"] = ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05})
+            return inputs
 
         RETURN_TYPES = ("MODEL",)
         FUNCTION = "apply"
         CATEGORY = "SnapRef"
-        DESCRIPTION = "Reference a character with one or two pictures. Write only the scene in the prompt."
+        DESCRIPTION = "Reference a character with up to eight pictures. Write only the scene in the prompt."
 
         @classmethod
         def IS_CHANGED(cls, reference=None, reference_2="none", **kw):
             out = []
-            for n in (reference, reference_2):
+            for n in (reference, reference_2, *(kw.get(f"reference_{i}") for i in range(3, MAX_REFERENCES + 1))):
                 if n and n != "none":
                     p = folder_paths.get_annotated_filepath(n)
                     out.append(f"{n}:{os.path.getmtime(p) if os.path.exists(p) else 0}")
@@ -88,18 +93,21 @@ def make_simple_node(core):
 
         @classmethod
         def VALIDATE_INPUTS(cls, reference=None, reference_2="none", **kw):
-            for n in (reference, reference_2):
+            for n in (reference, reference_2, *(kw.get(f"reference_{i}") for i in range(3, MAX_REFERENCES + 1))):
                 if n and n != "none" and not folder_paths.exists_annotated_filepath(n):
                     return f"Invalid image file: {n}"
             return True
 
-        def apply(self, model, clip, vae, adapter, reference, mode, strength, fidelity, reference_2="none", strength_2=1.0):
+        def apply(self, model, clip, vae, adapter, reference, mode, strength, fidelity, reference_2="none", strength_2=1.0, **kw):
             path = folder_paths.get_full_path_or_raise("loras", adapter)
             if path not in core._adapters:
                 core._adapters[path] = core._Adapter(path)
             ad = core._adapters[path]
             refs, weights = [], []
-            for name, w in ((reference, strength), (reference_2, strength_2)):
+            pairs = [(reference, strength), (reference_2, strength_2)]
+            pairs.extend((kw.get(f"reference_{i}", "none"), kw.get(f"strength_{i}", 1.0))
+                         for i in range(3, MAX_REFERENCES + 1))
+            for name, w in pairs:
                 if name and name != "none" and w > 0:
                     refs.append(load_input_image(name))
                     weights.append(float(w))
