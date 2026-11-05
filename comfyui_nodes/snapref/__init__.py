@@ -42,6 +42,7 @@ from safetensors import safe_open
 from safetensors.torch import load_file
 
 import comfy.patcher_extension
+from comfy.ldm.anima.model import Anima as AnimaModel
 import comfy.samplers
 import comfy.utils
 import folder_paths
@@ -77,6 +78,23 @@ def _hook_memory_release() -> None:
 _hook_memory_release()
 
 
+# Anima-2.9B inserts these blocks into the 28-block base, shifting its original layers.
+_INSERTED_29B = frozenset((2, 5, 8, 11, 14, 17, 21, 24, 27, 30, 33, 36))
+
+
+def _adapter_block_map(indices, model) -> tuple[int, ...]:
+    indices = set(indices)
+    if not indices:
+        raise ValueError("Adapter has no diffusion block weights")
+    model_blocks = len(model.blocks)
+    if max(indices) + 1 == model_blocks:
+        return tuple(range(model_blocks))
+    if isinstance(model, AnimaModel) and model_blocks == 40 and indices == set(range(28)):
+        return tuple(i for i in range(40) if i not in _INSERTED_29B)
+    raise ValueError(f"Adapter covers {max(indices) + 1} blocks but the model has {model_blocks}. "
+                     "Only native layouts and the 28-to-40-block Anima-2.9B expansion are supported.")
+
+
 class _Adapter:
     def __init__(self, path: str):
         tensors = load_file(path)
@@ -97,6 +115,7 @@ class _Adapter:
             down, up = (self._dequant(tensors, root + n) for n in ("lora_down", "lora_up"))
             alpha = float(tensors[root + "alpha"])
             self.lora.setdefault(name, {})[stream] = [down, up, alpha / down.shape[0]]
+        self.block_indices = {int(n.split(".")[1]) for n in self.lora if n.startswith("blocks.")}
         self.hooked = weakref.WeakSet()   # diffusion models carrying our hooks (id() is reused after unload)
         self.cache: dict = {}
 
@@ -111,11 +130,18 @@ class _Adapter:
     def install(self, dm) -> None:
         """Forward hooks on the targeted Linears (LoRA delta of the active stream) and the self-attention
         record / prepend patch. Both are no-ops unless this adapter is active."""
+        block_map = _adapter_block_map(self.block_indices, dm)
         if dm in self.hooked:
             return
-        self.hooked.add(dm)
+        # Resolve everything first; a failed install must not be remembered as successful.
+        targets = []
         for name, streams in self.lora.items():
+            if name.startswith("blocks."):
+                _, index, suffix = name.split(".", 2)
+                name = f"blocks.{block_map[int(index)]}.{suffix}"
             module = dm.get_submodule(name)
+            targets.append((module, streams))
+        for module, streams in targets:
 
             def hook(mod, args, out, _streams=streams, _me=self):
                 if _STATE["adapter"] is not _me or _STATE["stream"] not in _streams:
@@ -156,6 +182,7 @@ class _Adapter:
                     v = torch.cat([v_r.expand(v.shape[0], *v_r.shape[1:]).to(v.dtype), v], dim=1)
                 return _attn.compute_attention(q, k, v, transformer_options=transformer_options)
             attn.forward = forward
+        self.hooked.add(dm)
 
 
 def _set_attn_state(dm, state) -> None:
@@ -544,6 +571,7 @@ class SnapRef:
         if path not in _adapters:
             _adapters[path] = _Adapter(path)
         ad = _adapters[path]
+        _adapter_block_map(ad.block_indices, model.get_model_object("diffusion_model"))
         refs, weights = _reference_images([image, image_2, image_3], use_batch, [weight_1, weight_2, weight_3])
         if len(refs) > 1 and multi_layout == "stitch":
             refs, weights = [_stitch(refs)], [1.0]
@@ -583,7 +611,8 @@ import types as _types   # noqa: E402
 
 # the simple node reaches the core through a namespace (works both as a package module and as a loose file)
 SnapRefSimple = _simple.make_simple_node(_types.SimpleNamespace(
-    _adapters=_adapters, _Adapter=_Adapter, _encode_image=_encode_image, _make_wrapper=_make_wrapper, WRAPPER_KEY=WRAPPER_KEY))
+    _adapters=_adapters, _Adapter=_Adapter, _encode_image=_encode_image, _make_wrapper=_make_wrapper,
+    _adapter_block_map=_adapter_block_map, WRAPPER_KEY=WRAPPER_KEY))
 WEB_DIRECTORY = "./web"
 # "SnapRef" keeps its class name so saved workflows still load; it is shown as SnapRef (Advanced)
 NODE_CLASS_MAPPINGS = {"SnapRefSimple": SnapRefSimple, "SnapRef": SnapRef}
