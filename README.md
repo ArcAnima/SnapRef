@@ -16,6 +16,7 @@
   <a href="https://huggingface.co/0ppxnhximxr/snapref-v1a"><img src="https://img.shields.io/badge/🤗%20weights-snapref--v1a-ffcc4d" alt="weights v1a"></a>
   <a href="https://huggingface.co/0ppxnhximxr/snapref-v1b"><img src="https://img.shields.io/badge/🤗%20weights-snapref--v1b-ff6a62" alt="weights v1b"></a>
   <a href="https://huggingface.co/0ppxnhximxr/snapref-v2a-pre2"><img src="https://img.shields.io/badge/🤗%20preview-v2a--pre1%20·%20pre2-ff5a1f" alt="v2a preview"></a>
+  <a href="https://civitai.com/models/3028191/snapref"><img src="https://img.shields.io/badge/Civitai-SnapRef-1769ff" alt="Civitai SnapRef"></a>
   <img src="https://img.shields.io/badge/base-Anima%20v1.0-4b5bd6" alt="base model">
   <img src="https://img.shields.io/badge/ComfyUI-custom%20node-1b1b1f" alt="ComfyUI">
   <img src="https://img.shields.io/badge/weights-bf16%20%7C%20FP8-6c6a72" alt="bf16 / fp8">
@@ -29,7 +30,6 @@
 </p>
 
 <p align="center">
-  <a href="https://civitai.com/models/3028191/snapref">Civitai</a> ·
   <a href="#quick-start">Quick start</a> ·
   <a href="#v2a-preview">v2a preview</a> ·
   <a href="#results-v1a">Results</a> ·
