@@ -33,6 +33,8 @@ import hashlib
 import json
 import logging
 import math
+import uuid
+import weakref
 
 import torch
 import torch.nn.functional as F
@@ -95,7 +97,7 @@ class _Adapter:
             down, up = (self._dequant(tensors, root + n) for n in ("lora_down", "lora_up"))
             alpha = float(tensors[root + "alpha"])
             self.lora.setdefault(name, {})[stream] = [down, up, alpha / down.shape[0]]
-        self.hooked: set[int] = set()   # id() of diffusion models carrying our hooks
+        self.hooked = weakref.WeakSet()   # diffusion models carrying our hooks (id() is reused after unload)
         self.cache: dict = {}
 
     @staticmethod
@@ -109,9 +111,9 @@ class _Adapter:
     def install(self, dm) -> None:
         """Forward hooks on the targeted Linears (LoRA delta of the active stream) and the self-attention
         record / prepend patch. Both are no-ops unless this adapter is active."""
-        if id(dm) in self.hooked:
+        if dm in self.hooked:
             return
-        self.hooked.add(id(dm))
+        self.hooked.add(dm)
         for name, streams in self.lora.items():
             module = dm.get_submodule(name)
 
@@ -302,6 +304,15 @@ def _concat_kv(records: list[list]) -> list:
             for i in range(len(records[0]))]
 
 
+def _model_token(dm) -> str:
+    """Cache key for this model object (id() is reused after unload)."""
+    token = getattr(dm, "_snapref_token", None)
+    if token is None:
+        token = uuid.uuid4().hex
+        dm._snapref_token = token
+    return token
+
+
 def _ref_digest(ref_latents: list, ref_cond, mode: str) -> str:
     """Content key of a reference set: same pictures + caption + mode -> same K/V."""
     h = hashlib.sha1(mode.encode())
@@ -324,7 +335,7 @@ def _make_wrapper(adapter: _Adapter, ref_latents: list, ref_cond, mode: str, in_
         dm = executor.class_obj
         adapter.install(dm)
         options = kwargs.get("transformer_options", {})
-        key = (digest, id(dm), tuple(x.shape[-2:]), x.dtype, x.device)
+        key = (digest, _model_token(dm), tuple(x.shape[-2:]), x.dtype, x.device)
         if key not in adapter.cache:
             adapter.cache.clear()   # ~0.9 GB of K/V per 1 MP reference (bf16); keep one set
             cross, meta = ref_cond
