@@ -16,10 +16,10 @@
   <a href="https://huggingface.co/0ppxnhximxr/snapref-v1a"><img src="https://img.shields.io/badge/🤗%20weights-snapref--v1a-ffcc4d" alt="weights v1a"></a>
   <a href="https://huggingface.co/0ppxnhximxr/snapref-v1b"><img src="https://img.shields.io/badge/🤗%20weights-snapref--v1b-ff6a62" alt="weights v1b"></a>
   <a href="https://civitai.com/models/3028191/snapref"><img src="https://img.shields.io/badge/Civitai-SnapRef-1769ff" alt="Civitai SnapRef"></a>
-  <img src="https://img.shields.io/badge/base-Anima%20v1.0-4b5bd6" alt="base model">
-  <img src="https://img.shields.io/badge/ComfyUI-custom%20node-1b1b1f" alt="ComfyUI">
-  <img src="https://img.shields.io/badge/weights-bf16-6c6a72" alt="v2a weights bf16">
-  <img src="https://img.shields.io/badge/code-Apache--2.0-2ea44f" alt="code license">
+  <a href="https://huggingface.co/circlestone-labs/Anima"><img src="https://img.shields.io/badge/base-Anima%20v1.0-4b5bd6" alt="base model"></a>
+  <a href="https://github.com/ArcAnima/SnapRef/tree/main/comfyui_nodes/snapref"><img src="https://img.shields.io/badge/ComfyUI-custom%20node-1b1b1f" alt="ComfyUI"></a>
+  <a href="https://huggingface.co/0ppxnhximxr/snapref-v2a/tree/main"><img src="https://img.shields.io/badge/weights-bf16-6c6a72" alt="v2a weights bf16"></a>
+  <a href="https://github.com/ArcAnima/SnapRef/blob/main/LICENSE"><img src="https://img.shields.io/badge/code-Apache--2.0-2ea44f" alt="code license"></a>
 </p>
 
 <p align="center">
