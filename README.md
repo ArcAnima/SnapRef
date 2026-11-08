@@ -10,12 +10,15 @@
 > **Please support SnapRef!** Developing these models has taken **400+ H100 GPU-hours** so far.
 > If SnapRef is useful to you, a ⭐ on [GitHub](https://github.com/ArcAnima/SnapRef), sharing your results or
 > reporting issues helps a lot, and GPU sponsorship is very welcome.
+>
+> **[Support SnapRef on Ko-fi](https://ko-fi.com/luis3207)**
 
 <p align="center">
   <a href="https://huggingface.co/0ppxnhximxr/snapref-v2a"><img src="https://img.shields.io/badge/🤗%20weights-snapref--v2a%20stable-ff5a1f" alt="weights v2a stable"></a>
   <a href="https://huggingface.co/0ppxnhximxr/snapref-v1a"><img src="https://img.shields.io/badge/🤗%20weights-snapref--v1a-ffcc4d" alt="weights v1a"></a>
   <a href="https://huggingface.co/0ppxnhximxr/snapref-v1b"><img src="https://img.shields.io/badge/🤗%20weights-snapref--v1b-ff6a62" alt="weights v1b"></a>
   <a href="https://civitai.com/models/3028191/snapref"><img src="https://img.shields.io/badge/Civitai-SnapRef-1769ff" alt="Civitai SnapRef"></a>
+  <a href="https://ko-fi.com/luis3207"><img src="https://img.shields.io/badge/Ko--fi-Support_SnapRef-ff5e5b?logo=kofi&amp;logoColor=white" alt="Support SnapRef on Ko-fi"></a>
   <a href="https://huggingface.co/circlestone-labs/Anima"><img src="https://img.shields.io/badge/base-Anima%20v1.0-4b5bd6" alt="base model"></a>
   <a href="https://github.com/ArcAnima/SnapRef/tree/main/comfyui_nodes/snapref"><img src="https://img.shields.io/badge/ComfyUI-custom%20node-1b1b1f" alt="ComfyUI"></a>
   <a href="https://huggingface.co/0ppxnhximxr/snapref-v2a/tree/main"><img src="https://img.shields.io/badge/weights-bf16-6c6a72" alt="v2a weights bf16"></a>
