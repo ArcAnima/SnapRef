@@ -15,7 +15,7 @@
 
 <p align="center">
   <a href="https://huggingface.co/0ppxnhximxr/snapref-v2a"><img src="https://img.shields.io/badge/🤗%20weights-snapref--v2a%20stable-ff5a1f" alt="weights v2a stable"></a>
-  <a href="https://civitai.com/models/3028191/snapref"><img src="https://img.shields.io/badge/Civitai-SnapRef-1769ff" alt="Civitai SnapRef"></a>
+  <a href="https://civitai.com/models/3028191/snapref?modelVersionId=3457619"><img src="https://img.shields.io/badge/Civitai-SnapRef-1769ff" alt="Civitai SnapRef"></a>
   <a href="https://ko-fi.com/luis3207"><img src="https://img.shields.io/badge/Ko--fi-Support_SnapRef-ff5e5b?logo=kofi&amp;logoColor=white" alt="Support SnapRef on Ko-fi"></a>
   <a href="https://huggingface.co/circlestone-labs/Anima"><img src="https://img.shields.io/badge/base-Anima%20v1.0-4b5bd6" alt="base model"></a>
   <a href="https://github.com/ArcAnima/SnapRef/tree/main/comfyui_nodes/snapref"><img src="https://img.shields.io/badge/ComfyUI-custom%20node-1b1b1f" alt="ComfyUI"></a>
@@ -41,14 +41,14 @@
 
 This repository contains the training, data generation and evaluation code for **SnapRef**, a reference
 adapter for [Anima](https://huggingface.co/circlestone-labs/Anima) base v1.0.
-**[v2a stable](https://huggingface.co/0ppxnhximxr/snapref-v2a)** is the selected stable model;
+**[v2a stable](https://civitai.com/models/3028191/snapref?modelVersionId=3457619)** is the selected stable model;
 [v1a](https://huggingface.co/0ppxnhximxr/snapref-v1a),
 [v1b](https://huggingface.co/0ppxnhximxr/snapref-v1b) and the earlier
 [pre1](https://huggingface.co/0ppxnhximxr/snapref-v2a-pre1) /
 [pre2](https://huggingface.co/0ppxnhximxr/snapref-v2a-pre2) builds remain available for comparison.
 The node in `comfyui_nodes/snapref/` supports these adapter versions.
 
-The v2a weight repository is currently private. Public downloads of v1a and the earlier releases remain available.
+Download v2a stable from [Civitai](https://civitai.com/models/3028191/snapref?modelVersionId=3457619), together with the [node and workflows ZIP](https://civitai.com/api/download/models/3457619?type=Archive&format=Other).
 
 ## Highlights
 
@@ -71,16 +71,16 @@ The v2a weight repository is currently private. Public downloads of v1a and the 
 
    | weights | |
    |---|---|
-   | [`snapref_v2a.safetensors`](https://huggingface.co/0ppxnhximxr/snapref-v2a) | stable; repository currently private |
+   | [`snapref_v2a.safetensors`](https://civitai.com/models/3028191/snapref?modelVersionId=3457619) | stable; public download on Civitai |
    | [`snapref_v1a.safetensors`](https://huggingface.co/0ppxnhximxr/snapref-v1a) | previous stable release; public download |
    | [`snapref_v2a_pre2.safetensors`](https://huggingface.co/0ppxnhximxr/snapref-v2a-pre2) | earlier preview |
    | [`snapref_v2a_pre1.safetensors`](https://huggingface.co/0ppxnhximxr/snapref-v2a-pre1) | earlier preview |
    | [`snapref_v1b.safetensors`](https://huggingface.co/0ppxnhximxr/snapref-v1b) | twice the LoRA rank of v1a |
 
    v1a, v1b and the preview builds also have FP8 variants. The v2a stable file is bf16.
-4. Open an existing SnapRef workflow, select the adapter you downloaded, add your reference and queue.
-   The [pre2 example workflows](https://huggingface.co/0ppxnhximxr/snapref-v2a-pre2/tree/main/workflows)
-   also work with v2a stable after changing the adapter selection.
+4. Download the [v2a node and workflows ZIP](https://civitai.com/api/download/models/3457619?type=Archive&format=Other), then open
+   `workflows/snapref_v2a_simple.json`, choose your reference image and queue. The ZIP includes six workflows
+   configured for `snapref_v2a.safetensors`.
 
 ```text
 masterpiece, best quality, score_7, safe, 1girl, solo, full body, sitting, crossed legs, bench, street, night
