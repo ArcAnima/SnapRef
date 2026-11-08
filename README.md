@@ -15,6 +15,7 @@
 
 <p align="center">
   <a href="https://huggingface.co/0ppxnhximxr/snapref-v2a"><img src="https://img.shields.io/badge/🤗%20weights-snapref--v2a%20stable-ff5a1f" alt="weights v2a stable"></a>
+  <a href="https://huggingface.co/spaces/0ppxnhximxr/snapref"><img src="https://img.shields.io/badge/%F0%9F%A4%97%20Space-Try%20SnapRef-ffcc4d" alt="Try SnapRef on Hugging Face Spaces"></a>
   <a href="https://civitai.com/models/3028191/snapref?modelVersionId=3457619"><img src="https://img.shields.io/badge/Civitai-SnapRef-1769ff" alt="Civitai SnapRef"></a>
   <a href="https://ko-fi.com/luis3207"><img src="https://img.shields.io/badge/Ko--fi-Support_SnapRef-ff5e5b?logo=kofi&amp;logoColor=white" alt="Support SnapRef on Ko-fi"></a>
   <a href="https://huggingface.co/circlestone-labs/Anima"><img src="https://img.shields.io/badge/base-Anima%20v1.0-4b5bd6" alt="base model"></a>
