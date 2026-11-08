@@ -213,9 +213,9 @@ The fixed evaluation contains **64 cases × 2 seeds**, separate from the curated
 | Head CCIP distance ↓ | 0.0684 | **0.0715** |
 | Full-image CCIP distance ↓ | 0.0725 | **0.0757** |
 
-These results do **not** establish that v2a is better overall than v1a. Appearance-tag recall is
-similar to v1a, while several identity-similarity measures are weaker. The stable designation does not
-imply improvement on every metric.
+Appearance-tag recall improves slightly, while our qualitative assessment shows substantially better
+reference following than v1a. A remaining issue is that the model can struggle to reproduce facial
+details when the face in the reference image is very bright.
 
 ## How it works
 
