@@ -295,8 +295,11 @@ Data generation and training of v1a alone took about 120 H100 GPU-hours.
   dropped the reference.
 - **Spectrum:** works with `ref_guidance_on` off. With it on, Spectrum-type step forecasting breaks; the node now
   logs a warning.
-- **sorryhyun Mod Guidance:** with the default settings it can stop with a tensor-size error (4 vs 2). Turning on
-  `ref_in_uncond` or `ref_guidance_on` avoids it.
+- **sorryhyun Spectrum/Mod Guidance:** the default positive-only reference setting works with the updated node.
+  Reference encoding excludes target modulation, and Mod Guidance's full CFG batch is kept intact while only
+  positive rows read the reference. This fixes the reported 4-vs-2 error without enabling `ref_in_uncond` or
+  `ref_guidance_on`. Actual image batches larger than one also need Spectrum's own projection-row expansion fix
+  (tested against 2.13.4); SnapRef alone cannot repair Spectrum's cached-forward batch handling.
 - **SageAttention:** with `strength` or reference weights ≠ 1, the reference part uses PyTorch's fused attention,
   so a GPU where Sage is much faster can be slightly slower there.
 - **Reference cache:** the reference is encoded once and kept between runs while the picture and settings stay the

@@ -35,6 +35,7 @@ import logging
 import math
 import uuid
 import weakref
+from contextlib import contextmanager
 
 import torch
 import torch.nn.functional as F
@@ -52,6 +53,20 @@ WRAPPER_KEY = "snapref"
 NO_REF_KEY = "snapref_off"   # transformer_options flag: run this call without the reference
 _STATE = {"adapter": None, "stream": None}   # LoRA hooks apply only while an adapter is active
 _adapters: dict[str, "_Adapter"] = {}
+
+
+@contextmanager
+def _reference_context(dm):
+    # Spectrum Mod Guidance steers the target batch, never the clean reference.
+    attrs = ((getattr(dm, "t_embedding_norm", None), "_anima_mod_delta"), (dm, "_anima_mod_block_state"))
+    saved = [(obj, name, getattr(obj, name)) for obj, name in attrs if hasattr(obj, name)]
+    try:
+        for obj, name, _ in saved:
+            setattr(obj, name, None)
+        yield
+    finally:
+        for obj, name, value in saved:
+            setattr(obj, name, value)
 
 
 def _drop_reference_caches() -> None:
@@ -239,8 +254,8 @@ def _rows_attention(q, k_t, v_t, kv_ref, sizes, biases, rows, row_biases=None):
     qh, kt, vt = q.transpose(1, 2), k_t.transpose(1, 2), v_t.transpose(1, 2)
     try:
         out_t, lse_t = _lse_attention(qh, kt, vt)
-    except RuntimeError:   # no fused kernel: fall back to the split path (two calls)
-        return None
+    except RuntimeError:
+        return _masked_attention(q, k_t, v_t, kv_ref, sizes, biases, rows, row_biases)
     sel = torch.as_tensor(rows, device=q.device)
     k_r, v_r = kv_ref
     starts = [sum(sizes[:i]) for i in range(len(sizes))]
@@ -263,7 +278,7 @@ def _rows_attention(q, k_t, v_t, kv_ref, sizes, biases, rows, row_biases=None):
     return out.to(q.dtype).transpose(1, 2).reshape(B, S, H * D)
 
 
-def _masked_attention(q, k_t, v_t, kv_ref, sizes, biases):
+def _masked_attention(q, k_t, v_t, kv_ref, sizes, biases, rows=None, row_biases=None):
     """Reference implementation (and fallback) of _weighted_attention: SDPA with an additive key mask."""
     k_r, v_r = kv_ref
     B, S, H, D = q.shape
@@ -273,11 +288,17 @@ def _masked_attention(q, k_t, v_t, kv_ref, sizes, biases):
     pad = (-n) % 16
     if pad:
         k, v = F.pad(k, (0, 0, 0, pad)), F.pad(v, (0, 0, 0, pad))
-    mask = torch.zeros(1, 1, 1, n + pad, device=q.device, dtype=q.dtype)
+    mask = torch.zeros(B if rows is not None else 1, 1, 1, n + pad, device=q.device, dtype=q.dtype)
     start = 0
     for size, bias in zip(sizes, biases):
         mask[..., start:start + size] = bias
         start += size
+    if rows is not None:
+        selected = torch.zeros(B, device=q.device, dtype=torch.bool)
+        selected[rows] = True
+        mask[~selected, ..., :start] = float("-inf")
+        if row_biases is not None:
+            mask[rows, ..., :start] += torch.as_tensor(row_biases, device=q.device, dtype=q.dtype).view(-1, 1, 1, 1)
     if pad:
         mask[..., n:] = float("-inf")
     out = F.scaled_dot_product_attention(q.transpose(1, 2), k, v, attn_mask=mask.expand(B, H, S, n + pad))
@@ -370,8 +391,9 @@ def _make_wrapper(adapter: _Adapter, ref_latents: list, ref_cond, mode: str, in_
             ctx = dm.preprocess_text_embeds(cross.to(x.device, x.dtype),
                                             None if ids is None else ids.unsqueeze(0).to(x.device),
                                             None if weights is None else weights.unsqueeze(0).unsqueeze(-1).to(x.device, x.dtype))
-            records = [_encode_reference(adapter, dm, lat.to(x.device, x.dtype), ctx, tuple(x.shape[-2:]), mode)
-                       for lat in ref_latents]
+            with _reference_context(dm):
+                records = [_encode_reference(adapter, dm, lat.to(x.device, x.dtype), ctx, tuple(x.shape[-2:]), mode)
+                           for lat in ref_latents]
             adapter.cache[key] = (_concat_kv(records), [r[0][0].shape[1] for r in records])
         cache, sizes = adapter.cache[key]
         flags = options.get("cond_or_uncond") or [0]
@@ -406,6 +428,17 @@ def _make_wrapper(adapter: _Adapter, ref_latents: list, ref_cond, mode: str, in_
             use = [True] * len(flags)   # no fused kernel: the negative branch reads the reference fully
         if all(use) or not any(use):
             return run(x, timesteps, context, use[0], kwargs)
+        if getattr(getattr(dm, "t_embedding_norm", None), "_anima_mod_delta", None) is not None \
+                or getattr(dm, "_anima_mod_block_state", None) is not None:
+            # Mod Guidance's ambient hooks own this full CFG batch; mask reference rows instead of splitting it.
+            rows = [r for r in range(x.shape[0]) if use[r // n]]
+            _set_attn_state(dm, {"cache": cache, "sizes": sizes, "biases": biases, "rows": rows})
+            _STATE.update(adapter=adapter, stream="tgt")
+            try:
+                return executor(x, timesteps, context, fps, padding_mask, **kwargs)
+            finally:
+                _set_attn_state(dm, None)
+                _STATE.update(adapter=None, stream=None)
         # mixed cond/uncond batch (rare for Anima: ComfyUI batches cond and uncond only when their text lengths match):
         # run the two parts separately
         # shortcut: only x / timesteps / context are split; per-batch extras in kwargs (e.g. ControlNet) are not
