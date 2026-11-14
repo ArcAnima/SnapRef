@@ -33,6 +33,7 @@ import hashlib
 import json
 import logging
 import math
+import os
 import uuid
 import weakref
 from contextlib import contextmanager
@@ -458,13 +459,65 @@ def _make_outer(adapter: _Adapter):
     return wrapper
 
 
+_FP64_ARITH: dict[str, bool] = {}   # device.type -> can this backend compute in float64
+
+
+def _fp64_env_override():
+    """SNAPREF_FP64=0 forces the float32 correction, =1 forces float64, unset probes the backend."""
+    raw = os.environ.get("SNAPREF_FP64", "").strip().lower()
+    if raw in ("0", "false", "off", "no"):
+        return False
+    if raw in ("1", "true", "on", "yes"):
+        return True
+    return None
+
+
+def _fp64_arith_ok(device) -> bool:
+    """True only if the backend can actually compute in float64, not merely hold a float64 dtype.
+
+    Intel XPU's PyTorch build accepts the cast and shape ops but has no float64 arithmetic:
+    `f64 * 2.0 + 1.0` raises "Required aspect fp64 is not supported on the device" and
+    `f64.sum()` raises "Kernel is incompatible with all devices in devs". A dtype cast alone
+    is therefore not evidence of support, and the probe has to run both an elementwise op and
+    a reduction. Backends are probed once each, on an 8-element tensor, and the answer is cached
+    by device type; a backend that does support float64 keeps it.
+    """
+    override = _fp64_env_override()
+    if override is not None:
+        return override
+    key = getattr(device, "type", None) or str(device)
+    hit = _FP64_ARITH.get(key)
+    if hit is not None:
+        return hit
+    try:
+        probe = torch.ones(8, device=device, dtype=torch.float64)
+        float((probe * 2.0 + 1.0).sum().item())
+        ok = True
+    except (RuntimeError, NotImplementedError, TypeError):
+        ok = False
+    _FP64_ARITH[key] = ok
+    return ok
+
+
+def _correction_dtype(t):
+    """float64 where the backend can run it, float32 everywhere else.
+
+    Downstream of _fp64_arith_ok: the correction only leaves float64 when a real arithmetic
+    probe on that device has failed, so a backend we have never seen keeps float64 unless it
+    cannot run it. float32 is safe here because APG only projects the update onto the
+    per-sample direction of the conditional x0 prediction, with no cross-sample accumulation.
+    """
+    return torch.float64 if _fp64_arith_ok(t.device) else torch.float32
+
+
 def _correct(guided, pos, correction, rescale_phi=0.5):
     """APG (drop the update's component parallel to the cond prediction) or CFG rescale, in x0 space
     (as ElectronGirl/ComfyUI-Anima-Ref-Adapter, Apache-2.0)."""
     dims = tuple(range(1, pos.ndim))
     if correction == "apg":
-        update = (guided - pos).double()
-        unit = F.normalize(pos.double().flatten(1), dim=1).view_as(pos)
+        cdt = _correction_dtype(pos)
+        update = (guided - pos).to(cdt)
+        unit = F.normalize(pos.to(cdt).flatten(1), dim=1).view_as(pos)
         return pos + (update - (update * unit).sum(dim=dims, keepdim=True) * unit).to(pos.dtype)
     if correction == "rescale":
         ratio = pos.std(dim=dims, keepdim=True) / guided.std(dim=dims, keepdim=True)
