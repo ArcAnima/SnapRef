@@ -448,12 +448,12 @@ def _make_wrapper(adapter: _Adapter, ref_latents: list, ref_cond, mode: str, in_
         else:
             use = [f == 0 or in_uncond for f in flags]   # 0 = positive, 1 = negative
 
-        def run(xs, ts, cs, with_ref, kw):
+        def run(xs, ts, cs, with_ref, kw, pm=padding_mask):
             # the "tgt" LoRA is on in every target forward, with or without the reference (as in training)
             _set_attn_state(dm, {"cache": cache, "sizes": sizes, "biases": biases} if with_ref else None)
             _STATE.update(adapter=adapter, stream="tgt")
             try:
-                return executor(xs, ts, cs, fps, padding_mask, **kw)
+                return executor(xs, ts, cs, fps, pm, **kw)
             finally:
                 _set_attn_state(dm, None)
                 _STATE.update(adapter=None, stream=None)
@@ -485,15 +485,42 @@ def _make_wrapper(adapter: _Adapter, ref_latents: list, ref_cond, mode: str, in_
             finally:
                 _set_attn_state(dm, None)
                 _STATE.update(adapter=None, stream=None)
-        # mixed cond/uncond batch (rare for Anima: ComfyUI batches cond and uncond only when their text lengths match):
-        # run the two parts separately
-        # shortcut: only x / timesteps / context are split; per-batch extras in kwargs (e.g. ControlNet) are not
+        # mixed cond/uncond batch (ComfyUI batches cond and uncond when their text lengths match, and Anima pads
+        # every prompt to 512 tokens): run the two parts separately, each with its own share of the per-batch
+        # extras (extra conds such as ppm NegPip's mask, cond_or_uncond / uuids / sigmas)
         outs = []
         for i, u in enumerate(use):
             sl = slice(i * n, (i + 1) * n)
-            outs.append(run(x[sl], timesteps[sl], context[sl], u, kwargs))
+            outs.append(run(x[sl], timesteps[sl], context[sl], u, _chunk_kwargs(kwargs, sl, x.shape[0], i, len(flags)),
+                            _chunk_tensor(padding_mask, sl, x.shape[0])))
         return torch.cat(outs, dim=0)
     return wrapper
+
+
+def _chunk_tensor(value, sl, batch):
+    return value[sl] if torch.is_tensor(value) and value.ndim and value.shape[0] == batch else value
+
+
+def _chunk_kwargs(kwargs: dict, sl: slice, batch: int, chunk: int, chunks: int) -> dict:
+    """The diffusion-model kwargs of one cond/uncond chunk of a split call. Extra conds arrive with the full
+    batch (e.g. ppm NegPip's c_ppm_negpip_mask, [B, 512, 1]); passing them unsliced makes the inner wrappers
+    see two rows for a one-row call (KSampler error with older ppm, NegPip silently skipped with newer)."""
+    out = {}
+    for key, value in kwargs.items():
+        if key == "transformer_options" and isinstance(value, dict):
+            value = dict(value)
+            for name in ("cond_or_uncond", "uuids"):
+                seq = value.get(name)
+                if isinstance(seq, (list, tuple)) and len(seq) == chunks:
+                    value[name] = [seq[chunk]]
+            if "sigmas" in value:
+                value["sigmas"] = _chunk_tensor(value["sigmas"], sl, batch)
+        elif isinstance(value, (list, tuple)) and value and all(torch.is_tensor(v) for v in value):
+            value = type(value)(_chunk_tensor(v, sl, batch) for v in value)
+        else:
+            value = _chunk_tensor(value, sl, batch)
+        out[key] = value
+    return out
 
 
 def _make_outer(adapter: _Adapter):
