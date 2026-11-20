@@ -797,9 +797,9 @@ def _loaded_elsewhere() -> str | None:
     from comfyui_nodes/ next to a clone of the whole repository), or None."""
     here = os.path.dirname(os.path.realpath(__file__))
     for mod in list(sys.modules.values()):
-        try:
-            attrs = vars(mod)
-        except TypeError:
+        try:   # plain __dict__ read: never triggers a lazily loaded module
+            attrs = object.__getattribute__(mod, "__dict__")
+        except (AttributeError, TypeError):
             continue
         mapping = attrs.get("NODE_CLASS_MAPPINGS")
         if attrs.get("WRAPPER_KEY") != WRAPPER_KEY or not isinstance(mapping, dict) \
