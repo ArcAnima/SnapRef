@@ -15,5 +15,6 @@ Repository = "https://github.com/ArcAnima/SnapRef"
 PublisherId = ""
 DisplayName = "SnapRef"
 Icon = ""
-# Anima.preprocess_text_embeds(..., t5xxl_weights); older builds are refused with an update message
-requires-comfyui = ">=0.14.0"
+# Anima.preprocess_text_embeds(..., t5xxl_weights) and Attention.compute_qkv(..., transformer_options);
+# older builds are refused at the node with an update message
+requires-comfyui = ">=0.29.0"

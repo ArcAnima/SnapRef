@@ -113,29 +113,44 @@ def _adapter_block_map(indices, model) -> tuple[int, ...]:
                      "Only native layouts and the 28-to-40-block Anima-2.9B expansion are supported.")
 
 
-MIN_COMFYUI = "0.14.0"   # Anima.preprocess_text_embeds(text_embeds, text_ids, t5xxl_weights): ComfyUI 76a7fa9
+# Anima.preprocess_text_embeds(text_embeds, text_ids, t5xxl_weights): ComfyUI 0.14.0 (76a7fa9);
+# Attention.compute_qkv(x, context, rope_emb, transformer_options): ComfyUI 0.29.0 (0f42ba5)
+MIN_COMFYUI = "0.29.0"
+
+
+def _accepts(fn, positional: int = 0, keyword: str | None = None) -> bool:
+    try:
+        params = list(inspect.signature(fn).parameters.values())
+    except (TypeError, ValueError):
+        return True   # cannot tell: let it run
+    if keyword is not None and not any(p.name == keyword or p.kind is p.VAR_KEYWORD for p in params):
+        return False
+    return any(p.kind is p.VAR_POSITIONAL for p in params) or \
+        sum(p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD) for p in params) >= positional
 
 
 def _require_comfyui(dm) -> None:
-    """Fail at the node, with a clear message, on a ComfyUI older than MIN_COMFYUI. Older builds have
-    preprocess_text_embeds(text_embeds, text_ids) and fail inside KSampler with "takes 3 positional arguments
-    but 4 were given"."""
+    """Fail at the node, with a clear message, on a ComfyUI older than MIN_COMFYUI. Before 0.14.0 KSampler fails
+    with "preprocess_text_embeds() takes 3 positional arguments but 4 were given", before 0.29.0 with
+    "compute_qkv() got an unexpected keyword argument 'transformer_options'"."""
+    missing = []
     fn = getattr(dm, "preprocess_text_embeds", None)
-    if not callable(fn):
-        return
+    if callable(fn) and not _accepts(fn, positional=3):
+        missing.append("Anima.preprocess_text_embeds(..., t5xxl_weights)")
     try:
-        params = inspect.signature(fn).parameters.values()
-    except (TypeError, ValueError):
-        return
-    if any(p.kind is p.VAR_POSITIONAL for p in params) or \
-            sum(p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD) for p in params) >= 3:
+        fn = dm.blocks[0].self_attn.compute_qkv
+    except (AttributeError, IndexError, TypeError):
+        fn = None
+    if callable(fn) and not _accepts(fn, keyword="transformer_options"):
+        missing.append("Attention.compute_qkv(..., transformer_options)")
+    if not missing:
         return
     try:
         from comfyui_version import __version__ as found
     except ImportError:
         found = "unknown"
-    raise RuntimeError(f"SnapRef needs ComfyUI {MIN_COMFYUI} or newer (this ComfyUI: {found}; its "
-                       "Anima.preprocess_text_embeds takes no t5xxl_weights). Update ComfyUI and restart it.")
+    raise RuntimeError(f"SnapRef needs ComfyUI {MIN_COMFYUI} or newer (this ComfyUI: {found}; missing "
+                       f"{' and '.join(missing)}). Update ComfyUI and restart it.")
 
 
 class _Adapter:
