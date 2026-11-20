@@ -681,9 +681,11 @@ class SnapRef:
             "ref_megapixels": ("FLOAT", {"default": 1.0, "min": 0.25, "max": 2.0, "step": 0.05,
                                          "tooltip": "the reference is shrunk (never enlarged) to this area, aspect kept; trained at <= 1.0"}),
         }, "optional": {
-            "strength": ("FLOAT", {"default": 0.0, "min": -3.0, "max": 3.0, "step": 0.1,
-                                   "tooltip": "attention to the reference, log scale. 0 = as trained; +1 = about 2.7x more, "
-                                              "-1 = about 2.7x less. Non-zero values make sampling about 1.3x slower"}),
+            "strength": ("FLOAT", {"default": 0.0, "min": -3.0, "max": 3.0, "step": 0.1, "display_name": "strength (log)",
+                                   "tooltip": "attention to every reference, LOG scale: 0 = as trained; +0.7 = about 2x, "
+                                              "+1 = about 2.7x, -0.7 = about 0.5x. Not the scale of Strength on the simple "
+                                              "SnapRef node, which is linear (1 = as trained): simple 2 = +0.7 here, "
+                                              "simple 0.5 = -0.7"}),
             "ref_caption": ("STRING", {"multiline": True, "default": "",
                                        "tooltip": "optional appearance tags of the reference (gender, solo, hair, eyes, outfit); "
                                                   "no name or artist. Empty works."}),
@@ -706,8 +708,9 @@ class SnapRef:
                              "encoded on its own (sharper, slower with more references); stitch = side by side in one "
                              "ref_megapixels image (as Image Stitch, same speed as one reference)"}),
             "weight_1": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05,
-                                   "tooltip": "how much image (the first reference) counts; 1 = as trained. Only with "
-                                              "several references in multi_layout separate. No speed cost"}),
+                                   "tooltip": "how much image (the first reference) counts, LINEAR: 1 = as trained, "
+                                              "2 = twice, 0 = ignored (the scale of Strength on the simple SnapRef node). "
+                                              "Multiplies with strength (log). Ignored with multi_layout stitch"}),
             "weight_2": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05,
                                    "tooltip": "how much image_2 counts (e.g. 0.4: mostly the first image, a little of this "
                                               "one); 0 = ignored"}),

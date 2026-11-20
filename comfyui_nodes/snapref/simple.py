@@ -63,7 +63,9 @@ def make_simple_node(core):
                                        "tooltip": "Character & Style: character and art style from the picture. Character: "
                                                   "only the character; the style comes from the model and your prompt"}),
                 "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05,
-                                       "tooltip": "how much the picture counts: 1 = as trained, 0 = off, 2 = twice"}),
+                                       "tooltip": "how much the picture counts, LINEAR: 1 = as trained, 0 = off, 2 = twice. "
+                                                  "SnapRef (Advanced) has a log-scale strength instead (0 = as trained; "
+                                                  "2 here = +0.7 there); this one matches its weight_1..3"}),
                 "fidelity": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05,
                                        "tooltip": "1 = keep every detail of the picture; lower = follow the prompt more freely"}),
             }, "optional": {

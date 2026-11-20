@@ -166,6 +166,7 @@ function picture(node, slot, w, remove) {
   file.accept = "image/png,image/jpeg,image/webp";
   file.style.display = "none";
   const strength = slider("Strength", 0, 2, 0.05, () => w.strength?.value ?? 1, (v) => { w.strength.value = v; node.setDirtyCanvas(true, true); });
+  strength.el.title = "Linear: 1 = as trained, 0 = off, 2 = twice. (SnapRef (Advanced) strength is log scale: 0 = as trained.)";
 
   const render = () => {
     const url = viewUrl(w.name?.value);
