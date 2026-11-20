@@ -35,6 +35,7 @@ import json
 import logging
 import math
 import os
+import sys
 import uuid
 import weakref
 from contextlib import contextmanager
@@ -771,7 +772,36 @@ import types as _types   # noqa: E402
 SnapRefSimple = _simple.make_simple_node(_types.SimpleNamespace(
     _adapters=_adapters, _Adapter=_Adapter, _encode_image=_encode_image, _make_wrapper=_make_wrapper,
     _adapter_block_map=_adapter_block_map, _require_comfyui=_require_comfyui, WRAPPER_KEY=WRAPPER_KEY))
-WEB_DIRECTORY = "./web"
-# "SnapRef" keeps its class name so saved workflows still load; it is shown as SnapRef (Advanced)
-NODE_CLASS_MAPPINGS = {"SnapRefSimple": SnapRefSimple, "SnapRef": SnapRef}
-NODE_DISPLAY_NAME_MAPPINGS = {"SnapRefSimple": "SnapRef", "SnapRef": "SnapRef (Advanced)"}
+
+
+def _loaded_elsewhere() -> str | None:
+    """Folder of another SnapRef node package already loaded in this process (e.g. custom_nodes/snapref copied
+    from comfyui_nodes/ next to a clone of the whole repository), or None."""
+    here = os.path.dirname(os.path.realpath(__file__))
+    for mod in list(sys.modules.values()):
+        try:
+            attrs = vars(mod)
+        except TypeError:
+            continue
+        mapping = attrs.get("NODE_CLASS_MAPPINGS")
+        if attrs.get("WRAPPER_KEY") != WRAPPER_KEY or not isinstance(mapping, dict) \
+                or not ("SnapRef" in mapping or "SnapRefSimple" in mapping) or not attrs.get("__file__"):
+            continue
+        there = os.path.dirname(os.path.realpath(attrs["__file__"]))
+        if there != here:
+            return there
+    return None
+
+
+_ELSEWHERE = _loaded_elsewhere()
+if _ELSEWHERE is not None:
+    # register nothing (no second set of node classes, no second copy of the web extension)
+    logging.warning(f"[SnapRef] already loaded from {_ELSEWHERE}; skipping the copy in "
+                    f"{os.path.dirname(os.path.realpath(__file__))}. Keep only one SnapRef in custom_nodes.")
+    WEB_DIRECTORY = None
+    NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS = {}, {}
+else:
+    WEB_DIRECTORY = "./web"
+    # "SnapRef" keeps its class name so saved workflows still load; it is shown as SnapRef (Advanced)
+    NODE_CLASS_MAPPINGS = {"SnapRefSimple": SnapRefSimple, "SnapRef": SnapRef}
+    NODE_DISPLAY_NAME_MAPPINGS = {"SnapRefSimple": "SnapRef", "SnapRef": "SnapRef (Advanced)"}
