@@ -95,7 +95,8 @@ class ProbeTests(unittest.TestCase):
             def item(self):
                 return self.inner.item()
 
-        with patch.object(torch, "ones", lambda *a, **kw: SumFails(real_ones(*a, **kw))):
+        # the stand-in tensor lives on the CPU: builds without XPU cannot allocate on "xpu"
+        with patch.object(torch, "ones", lambda *a, **kw: SumFails(real_ones(*a, **{**kw, "device": "cpu"}))):
             self.assertIs(snapref._fp64_arith_ok(torch.device("xpu")), False)
 
     def test_unlisted_backend_keeps_float64_when_the_probe_passes(self):
