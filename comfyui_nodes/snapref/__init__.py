@@ -421,7 +421,7 @@ def _ref_digest(ref_latents: list, ref_cond, mode: str) -> str:
 def _make_wrapper(adapter: _Adapter, ref_latents: list, ref_cond, mode: str, in_uncond: bool, bias: float = 0.0,
                   weights: list | None = None, uncond_bias: float | None = None):
     """uncond_bias (Fidelity < 1): the negative branch also reads the reference with this extra log
-    bias. Needs the one-call mixed path (CUDA, fp16/bf16); elsewhere the negative branch reads it fully."""
+    bias, in one call for the whole batch (fused kernels on CUDA fp16/bf16, the masked SDPA elsewhere)."""
     weights = list(weights or [1.0] * len(ref_latents))
     digest = _ref_digest(ref_latents, ref_cond, mode)
     biases = [bias + math.log(w) for w in weights]   # weight-0 references were dropped before encoding
@@ -458,9 +458,9 @@ def _make_wrapper(adapter: _Adapter, ref_latents: list, ref_cond, mode: str, in_
                 _set_attn_state(dm, None)
                 _STATE.update(adapter=None, stream=None)
         n = x.shape[0] // len(flags)
-        if uncond_bias is not None and not options.get(NO_REF_KEY) and any(f == 1 for f in flags) \
-                and x.is_cuda and x.dtype in (torch.float16, torch.bfloat16):
-            # Fidelity: every row reads the reference, the uncond rows weaker (one call)
+        if uncond_bias is not None and not options.get(NO_REF_KEY) and any(f == 1 for f in flags):
+            # Fidelity: every row reads the reference, the uncond rows weaker (one call). On every device: without
+            # the fused kernels (MPS, CPU, fp32) _rows_attention falls back to the masked SDPA with the row biases.
             rows = list(range(x.shape[0]))
             row_biases = [uncond_bias if flags[r // n] == 1 else 0.0 for r in rows]
             _set_attn_state(dm, {"cache": cache, "sizes": sizes, "biases": biases, "rows": rows, "row_biases": row_biases})
@@ -470,8 +470,6 @@ def _make_wrapper(adapter: _Adapter, ref_latents: list, ref_cond, mode: str, in_
             finally:
                 _set_attn_state(dm, None)
                 _STATE.update(adapter=None, stream=None)
-        if uncond_bias is not None:
-            use = [True] * len(flags)   # no fused kernel: the negative branch reads the reference fully
         if all(use) or not any(use):
             return run(x, timesteps, context, use[0], kwargs)
         if getattr(getattr(dm, "t_embedding_norm", None), "_anima_mod_delta", None) is not None \
