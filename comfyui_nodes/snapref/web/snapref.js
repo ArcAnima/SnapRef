@@ -21,6 +21,41 @@ async function uploadFile(file) {
   return data.subfolder ? `${data.subfolder}/${data.name}` : data.name;
 }
 
+// What a drop carries: a local image file, or an image dragged from ComfyUI itself (queue, assets panel,
+// another node's preview), which arrives as a same-origin URL rather than a file. Synchronous: the DataTransfer
+// is emptied once the event has been handled.
+function transferSource(dt) {
+  const file = Array.from(dt?.files || []).find((f) => f?.type?.startsWith("image/"));
+  if (file) return { file };
+  const uri = (dt?.getData?.("text/uri-list") || "").split(/\r?\n/).find((l) => l && !l.startsWith("#"));
+  if (!uri) return null;
+  let url;
+  try { url = new URL(uri, location.href); } catch { return null; }
+  return url.origin === location.origin ? { url } : null;
+}
+
+async function resolveImage(source) {
+  if (!source) return null;
+  if (source.file) return source.file;
+  try {
+    const resp = await fetch(source.url);
+    if (!resp.ok) return null;
+    const blob = await resp.blob();
+    if (!blob.type.startsWith("image/")) return null;
+    const name = source.url.searchParams.get("filename") || source.url.pathname.split("/").pop() || "image.png";
+    return new File([blob], name, { type: blob.type });
+  } catch { return null; }
+}
+
+// Slot (0-based) for a picture pasted or dropped on the node outside the cards: the first empty shown slot,
+// else one more slot while there is room, else the first slot (the node's single upload target before).
+function pickSlot(filled, shown, max) {
+  const empty = filled.slice(0, shown).findIndex((f) => !f);
+  if (empty >= 0) return { slot: empty, shown };
+  if (shown < max) return { slot: shown, shown: shown + 1 };
+  return { slot: 0, shown };
+}
+
 function viewUrl(name) {
   if (!name || name === "none") return null;
   const parts = name.split("/");
@@ -131,6 +166,7 @@ function picture(node, slot, w, remove) {
   file.accept = "image/png,image/jpeg,image/webp";
   file.style.display = "none";
   const strength = slider("Strength", 0, 2, 0.05, () => w.strength?.value ?? 1, (v) => { w.strength.value = v; node.setDirtyCanvas(true, true); });
+  strength.el.title = "Linear: 1 = as trained, 0 = off, 2 = twice. (SnapRef (Advanced) strength is log scale: 0 = as trained.)";
 
   const render = () => {
     const url = viewUrl(w.name?.value);
@@ -172,7 +208,10 @@ function picture(node, slot, w, remove) {
   file.addEventListener("change", () => { setFile(file.files?.[0]); file.value = ""; });
   pic.addEventListener("dragover", (e) => { e.preventDefault(); e.stopPropagation(); pic.classList.add("drag"); });
   pic.addEventListener("dragleave", () => pic.classList.remove("drag"));
-  pic.addEventListener("drop", (e) => { e.preventDefault(); e.stopPropagation(); pic.classList.remove("drag"); setFile(e.dataTransfer?.files?.[0]); });
+  pic.addEventListener("drop", async (e) => {
+    e.preventDefault(); e.stopPropagation(); pic.classList.remove("drag");
+    setFile(await resolveImage(transferSource(e.dataTransfer)));
+  });
   x.addEventListener("click", (e) => {
     e.stopPropagation();
     if (slot === 1) { file.click(); return; }
@@ -180,7 +219,7 @@ function picture(node, slot, w, remove) {
   });
   pic.append(label, x, file);
   card.append(pic, strength.el);
-  return { el: card, render, invalidateUpload: () => { uploadVersion++; } };
+  return { el: card, render, setFile, invalidateUpload: () => { uploadVersion++; } };
 }
 
 app.registerExtension({
@@ -289,6 +328,29 @@ app.registerExtension({
         fid.sync();
       };
       node.snaprefSync = syncAll;
+      // The frontend sends pasted pictures and pictures dropped on the node (outside the cards) to the upload
+      // widget of `reference`, so they always replaced the first picture. Send them to a free slot instead.
+      const toFreeSlot = async (file) => {
+        if (!file) return false;
+        const shown = Number(node.properties.snapref_slots) || 2;
+        const pick = pickSlot(refWidgets.map((w) => !!viewUrl(w.name?.value)), shown, MAX_REFERENCES);
+        if (pick.shown !== shown) { node.properties.snapref_slots = pick.shown; syncAll(); }
+        await pictures[pick.slot].setFile(file);
+        return true;
+      };
+      const pasteFiles = node.pasteFiles;
+      node.pasteFiles = function (files) {
+        const file = Array.from(files || []).find((f) => f?.type?.startsWith("image/"));
+        if (!file) return pasteFiles?.apply(this, arguments) ?? false;
+        toFreeSlot(file);
+        return true;
+      };
+      const onDragDrop = node.onDragDrop;
+      node.onDragDrop = function (e) {
+        const source = transferSource(e?.dataTransfer);
+        if (!source) return onDragDrop?.apply(this, arguments) ?? false;
+        return resolveImage(source).then(toFreeSlot);
+      };
       for (const name of HIDDEN) {
         const w = W(name);
         if (!w) continue;

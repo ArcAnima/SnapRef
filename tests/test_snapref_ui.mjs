@@ -23,6 +23,38 @@ test('a removed slot cannot receive its pending upload', async () => {
   assert.equal(context.w.name.value, 'new-C.png');
 });
 
+const topLevel = (name) => source.match(new RegExp(`(?:async )?function ${name}\\([\\s\\S]*?\\n\\}\\n`))[0];
+
+test('pasted or node-dropped pictures go to a free slot, not always the first', () => {
+  const pickSlot = vm.runInNewContext(`(${topLevel('pickSlot')})`);
+  const plain = (r) => JSON.parse(JSON.stringify(r));
+  assert.deepEqual(plain(pickSlot([false, false, false], 2, 8)), { slot: 0, shown: 2 });
+  assert.deepEqual(plain(pickSlot([true, false, false], 2, 8)), { slot: 1, shown: 2 });
+  assert.deepEqual(plain(pickSlot([true, true, false], 2, 8)), { slot: 2, shown: 3 });
+  assert.deepEqual(plain(pickSlot([true, false, true, true], 4, 8)), { slot: 1, shown: 4 });
+  assert.deepEqual(plain(pickSlot(Array(8).fill(true), 8, 8)), { slot: 0, shown: 8 });
+});
+
+test('cards take files and images dragged from ComfyUI itself, not other sites', async () => {
+  const fetched = [];
+  const context = vm.createContext({
+    location: { href: 'http://127.0.0.1:8188/', origin: 'http://127.0.0.1:8188' }, URL,
+    File: class { constructor(parts, name, opts) { this.name = name; this.type = opts.type; } },
+    fetch: async (url) => { fetched.push(String(url)); return { ok: true, blob: async () => ({ type: 'image/png' }) }; },
+  });
+  vm.runInContext(`${topLevel('transferSource')}\n${topLevel('resolveImage')}`, context);
+  const dt = (files, uri = '') => ({ files, getData: (t) => (t === 'text/uri-list' ? uri : '') });
+  const png = { type: 'image/png', name: 'a.png' };
+  const pick = (d) => vm.runInContext('(d) => resolveImage(transferSource(d))', context)(d);
+  assert.equal(await pick(dt([png])), png);
+  assert.equal(await pick(dt([{ type: 'text/plain' }])), null);
+  const own = await pick(dt([], 'http://127.0.0.1:8188/api/view?filename=out_0001.png&type=output'));
+  assert.equal(own.name, 'out_0001.png');
+  assert.equal(await pick(dt([], 'https://example.com/x.png')), null);
+  assert.equal(await pick(dt([], '# comment')), null);
+  assert.deepEqual(fetched, ['http://127.0.0.1:8188/api/view?filename=out_0001.png&type=output']);
+});
+
 test('restoring saved rows preserves height; adding a row grows once', () => {
   const body = source.match(/const syncAll = \(resize = true\) => \{([\s\S]*?)\n      \};/)[1];
   const node = { properties: { snapref_slots: 3 }, size: [440, 800], computeSize: () => [440, 620], setSize(size) { this.size = size; } };

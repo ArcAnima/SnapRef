@@ -30,9 +30,12 @@ Weight files keep the internal tensor format anima_ref_kv/1 (key prefix anima_re
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import logging
 import math
+import os
+import sys
 import uuid
 import weakref
 from contextlib import contextmanager
@@ -108,6 +111,46 @@ def _adapter_block_map(indices, model) -> tuple[int, ...]:
         return tuple(i for i in range(40) if i not in _INSERTED_29B)
     raise ValueError(f"Adapter covers {max(indices) + 1} blocks but the model has {model_blocks}. "
                      "Only native layouts and the 28-to-40-block Anima-2.9B expansion are supported.")
+
+
+# Anima.preprocess_text_embeds(text_embeds, text_ids, t5xxl_weights): ComfyUI 0.14.0 (76a7fa9);
+# Attention.compute_qkv(x, context, rope_emb, transformer_options): ComfyUI 0.29.0 (0f42ba5)
+MIN_COMFYUI = "0.29.0"
+
+
+def _accepts(fn, positional: int = 0, keyword: str | None = None) -> bool:
+    try:
+        params = list(inspect.signature(fn).parameters.values())
+    except (TypeError, ValueError):
+        return True   # cannot tell: let it run
+    if keyword is not None and not any(p.name == keyword or p.kind is p.VAR_KEYWORD for p in params):
+        return False
+    return any(p.kind is p.VAR_POSITIONAL for p in params) or \
+        sum(p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD) for p in params) >= positional
+
+
+def _require_comfyui(dm) -> None:
+    """Fail at the node, with a clear message, on a ComfyUI older than MIN_COMFYUI. Before 0.14.0 KSampler fails
+    with "preprocess_text_embeds() takes 3 positional arguments but 4 were given", before 0.29.0 with
+    "compute_qkv() got an unexpected keyword argument 'transformer_options'"."""
+    missing = []
+    fn = getattr(dm, "preprocess_text_embeds", None)
+    if callable(fn) and not _accepts(fn, positional=3):
+        missing.append("Anima.preprocess_text_embeds(..., t5xxl_weights)")
+    try:
+        fn = dm.blocks[0].self_attn.compute_qkv
+    except (AttributeError, IndexError, TypeError):
+        fn = None
+    if callable(fn) and not _accepts(fn, keyword="transformer_options"):
+        missing.append("Attention.compute_qkv(..., transformer_options)")
+    if not missing:
+        return
+    try:
+        from comfyui_version import __version__ as found
+    except ImportError:
+        found = "unknown"
+    raise RuntimeError(f"SnapRef needs ComfyUI {MIN_COMFYUI} or newer (this ComfyUI: {found}; missing "
+                       f"{' and '.join(missing)}). Update ComfyUI and restart it.")
 
 
 class _Adapter:
@@ -279,13 +322,32 @@ def _rows_attention(q, k_t, v_t, kv_ref, sizes, biases, rows, row_biases=None):
 
 
 def _masked_attention(q, k_t, v_t, kv_ref, sizes, biases, rows=None, row_biases=None):
-    """Reference implementation (and fallback) of _weighted_attention: SDPA with an additive key mask."""
-    k_r, v_r = kv_ref
+    """Reference implementation (and fallback) of _weighted_attention: SDPA with an additive key mask.
+
+    rows: only these batch rows read the reference; row_biases: extra log bias per row in rows.
+    Off CUDA the mask holds no -inf: MPS returns NaN (a black image) for -inf in an additive mask, although no
+    query row is ever fully masked here. So off CUDA the keys are not padded, and rows that do not read the
+    reference run as a separate plain call over the target keys. On CUDA nothing changes: keys are padded to a
+    multiple of 16 (aligned mask rows for the memory-efficient kernel) and masked with -inf."""
     B, S, H, D = q.shape
+    if rows is not None and not q.is_cuda:
+        rows = list(rows)
+        others = [r for r in range(B) if r not in rows]
+        if others:
+            out = q.new_empty(B, S, H * D)
+            if rows:
+                sel = torch.as_tensor(rows, device=q.device)
+                out[sel] = _masked_attention(q[sel], k_t[sel], v_t[sel], kv_ref, sizes, biases,
+                                             list(range(len(rows))), row_biases)
+            o = torch.as_tensor(others, device=q.device)
+            plain = F.scaled_dot_product_attention(q[o].transpose(1, 2), k_t[o].transpose(1, 2), v_t[o].transpose(1, 2))
+            out[o] = plain.transpose(1, 2).reshape(len(others), S, H * D)
+            return out
+    k_r, v_r = kv_ref
     k = torch.cat([k_r.expand(B, *k_r.shape[1:]).to(q.dtype), k_t], dim=1).transpose(1, 2)
     v = torch.cat([v_r.expand(B, *v_r.shape[1:]).to(q.dtype), v_t], dim=1).transpose(1, 2)
     n = k.shape[2]
-    pad = (-n) % 16
+    pad = (-n) % 16 if q.is_cuda else 0
     if pad:
         k, v = F.pad(k, (0, 0, 0, pad)), F.pad(v, (0, 0, 0, pad))
     mask = torch.zeros(B if rows is not None else 1, 1, 1, n + pad, device=q.device, dtype=q.dtype)
@@ -375,7 +437,7 @@ def _ref_digest(ref_latents: list, ref_cond, mode: str) -> str:
 def _make_wrapper(adapter: _Adapter, ref_latents: list, ref_cond, mode: str, in_uncond: bool, bias: float = 0.0,
                   weights: list | None = None, uncond_bias: float | None = None):
     """uncond_bias (Fidelity < 1): the negative branch also reads the reference with this extra log
-    bias. Needs the one-call mixed path (CUDA, fp16/bf16); elsewhere the negative branch reads it fully."""
+    bias, in one call for the whole batch (fused kernels on CUDA fp16/bf16, the masked SDPA elsewhere)."""
     weights = list(weights or [1.0] * len(ref_latents))
     digest = _ref_digest(ref_latents, ref_cond, mode)
     biases = [bias + math.log(w) for w in weights]   # weight-0 references were dropped before encoding
@@ -402,19 +464,19 @@ def _make_wrapper(adapter: _Adapter, ref_latents: list, ref_cond, mode: str, in_
         else:
             use = [f == 0 or in_uncond for f in flags]   # 0 = positive, 1 = negative
 
-        def run(xs, ts, cs, with_ref, kw):
+        def run(xs, ts, cs, with_ref, kw, pm=padding_mask):
             # the "tgt" LoRA is on in every target forward, with or without the reference (as in training)
             _set_attn_state(dm, {"cache": cache, "sizes": sizes, "biases": biases} if with_ref else None)
             _STATE.update(adapter=adapter, stream="tgt")
             try:
-                return executor(xs, ts, cs, fps, padding_mask, **kw)
+                return executor(xs, ts, cs, fps, pm, **kw)
             finally:
                 _set_attn_state(dm, None)
                 _STATE.update(adapter=None, stream=None)
         n = x.shape[0] // len(flags)
-        if uncond_bias is not None and not options.get(NO_REF_KEY) and any(f == 1 for f in flags) \
-                and x.is_cuda and x.dtype in (torch.float16, torch.bfloat16):
-            # Fidelity: every row reads the reference, the uncond rows weaker (one call)
+        if uncond_bias is not None and not options.get(NO_REF_KEY) and any(f == 1 for f in flags):
+            # Fidelity: every row reads the reference, the uncond rows weaker (one call). On every device: without
+            # the fused kernels (MPS, CPU, fp32) _rows_attention falls back to the masked SDPA with the row biases.
             rows = list(range(x.shape[0]))
             row_biases = [uncond_bias if flags[r // n] == 1 else 0.0 for r in rows]
             _set_attn_state(dm, {"cache": cache, "sizes": sizes, "biases": biases, "rows": rows, "row_biases": row_biases})
@@ -424,8 +486,6 @@ def _make_wrapper(adapter: _Adapter, ref_latents: list, ref_cond, mode: str, in_
             finally:
                 _set_attn_state(dm, None)
                 _STATE.update(adapter=None, stream=None)
-        if uncond_bias is not None:
-            use = [True] * len(flags)   # no fused kernel: the negative branch reads the reference fully
         if all(use) or not any(use):
             return run(x, timesteps, context, use[0], kwargs)
         if getattr(getattr(dm, "t_embedding_norm", None), "_anima_mod_delta", None) is not None \
@@ -439,15 +499,42 @@ def _make_wrapper(adapter: _Adapter, ref_latents: list, ref_cond, mode: str, in_
             finally:
                 _set_attn_state(dm, None)
                 _STATE.update(adapter=None, stream=None)
-        # mixed cond/uncond batch (rare for Anima: ComfyUI batches cond and uncond only when their text lengths match):
-        # run the two parts separately
-        # shortcut: only x / timesteps / context are split; per-batch extras in kwargs (e.g. ControlNet) are not
+        # mixed cond/uncond batch (ComfyUI batches cond and uncond when their text lengths match, and Anima pads
+        # every prompt to 512 tokens): run the two parts separately, each with its own share of the per-batch
+        # extras (extra conds such as ppm NegPip's mask, cond_or_uncond / uuids / sigmas)
         outs = []
         for i, u in enumerate(use):
             sl = slice(i * n, (i + 1) * n)
-            outs.append(run(x[sl], timesteps[sl], context[sl], u, kwargs))
+            outs.append(run(x[sl], timesteps[sl], context[sl], u, _chunk_kwargs(kwargs, sl, x.shape[0], i, len(flags)),
+                            _chunk_tensor(padding_mask, sl, x.shape[0])))
         return torch.cat(outs, dim=0)
     return wrapper
+
+
+def _chunk_tensor(value, sl, batch):
+    return value[sl] if torch.is_tensor(value) and value.ndim and value.shape[0] == batch else value
+
+
+def _chunk_kwargs(kwargs: dict, sl: slice, batch: int, chunk: int, chunks: int) -> dict:
+    """The diffusion-model kwargs of one cond/uncond chunk of a split call. Extra conds arrive with the full
+    batch (e.g. ppm NegPip's c_ppm_negpip_mask, [B, 512, 1]); passing them unsliced makes the inner wrappers
+    see two rows for a one-row call (KSampler error with older ppm, NegPip silently skipped with newer)."""
+    out = {}
+    for key, value in kwargs.items():
+        if key == "transformer_options" and isinstance(value, dict):
+            value = dict(value)
+            for name in ("cond_or_uncond", "uuids"):
+                seq = value.get(name)
+                if isinstance(seq, (list, tuple)) and len(seq) == chunks:
+                    value[name] = [seq[chunk]]
+            if "sigmas" in value:
+                value["sigmas"] = _chunk_tensor(value["sigmas"], sl, batch)
+        elif isinstance(value, (list, tuple)) and value and all(torch.is_tensor(v) for v in value):
+            value = type(value)(_chunk_tensor(v, sl, batch) for v in value)
+        else:
+            value = _chunk_tensor(value, sl, batch)
+        out[key] = value
+    return out
 
 
 def _make_outer(adapter: _Adapter):
@@ -458,13 +545,65 @@ def _make_outer(adapter: _Adapter):
     return wrapper
 
 
+_FP64_ARITH: dict[str, bool] = {}   # device.type -> can this backend compute in float64
+
+
+def _fp64_env_override():
+    """SNAPREF_FP64=0 forces the float32 correction, =1 forces float64, unset probes the backend."""
+    raw = os.environ.get("SNAPREF_FP64", "").strip().lower()
+    if raw in ("0", "false", "off", "no"):
+        return False
+    if raw in ("1", "true", "on", "yes"):
+        return True
+    return None
+
+
+def _fp64_arith_ok(device) -> bool:
+    """True only if the backend can actually compute in float64, not merely hold a float64 dtype.
+
+    Intel XPU's PyTorch build accepts the cast and shape ops but has no float64 arithmetic:
+    `f64 * 2.0 + 1.0` raises "Required aspect fp64 is not supported on the device" and
+    `f64.sum()` raises "Kernel is incompatible with all devices in devs". A dtype cast alone
+    is therefore not evidence of support, and the probe has to run both an elementwise op and
+    a reduction. Backends are probed once each, on an 8-element tensor, and the answer is cached
+    by device type; a backend that does support float64 keeps it.
+    """
+    override = _fp64_env_override()
+    if override is not None:
+        return override
+    key = getattr(device, "type", None) or str(device)
+    hit = _FP64_ARITH.get(key)
+    if hit is not None:
+        return hit
+    try:
+        probe = torch.ones(8, device=device, dtype=torch.float64)
+        float((probe * 2.0 + 1.0).sum().item())
+        ok = True
+    except (RuntimeError, NotImplementedError, TypeError):
+        ok = False
+    _FP64_ARITH[key] = ok
+    return ok
+
+
+def _correction_dtype(t):
+    """float64 where the backend can run it, float32 everywhere else.
+
+    Downstream of _fp64_arith_ok: the correction only leaves float64 when a real arithmetic
+    probe on that device has failed, so a backend we have never seen keeps float64 unless it
+    cannot run it. float32 is safe here because APG only projects the update onto the
+    per-sample direction of the conditional x0 prediction, with no cross-sample accumulation.
+    """
+    return torch.float64 if _fp64_arith_ok(t.device) else torch.float32
+
+
 def _correct(guided, pos, correction, rescale_phi=0.5):
     """APG (drop the update's component parallel to the cond prediction) or CFG rescale, in x0 space
     (as ElectronGirl/ComfyUI-Anima-Ref-Adapter, Apache-2.0)."""
     dims = tuple(range(1, pos.ndim))
     if correction == "apg":
-        update = (guided - pos).double()
-        unit = F.normalize(pos.double().flatten(1), dim=1).view_as(pos)
+        cdt = _correction_dtype(pos)
+        update = (guided - pos).to(cdt)
+        unit = F.normalize(pos.to(cdt).flatten(1), dim=1).view_as(pos)
         return pos + (update - (update * unit).sum(dim=dims, keepdim=True) * unit).to(pos.dtype)
     if correction == "rescale":
         ratio = pos.std(dim=dims, keepdim=True) / guided.std(dim=dims, keepdim=True)
@@ -557,9 +696,11 @@ class SnapRef:
             "ref_megapixels": ("FLOAT", {"default": 1.0, "min": 0.25, "max": 2.0, "step": 0.05,
                                          "tooltip": "the reference is shrunk (never enlarged) to this area, aspect kept; trained at <= 1.0"}),
         }, "optional": {
-            "strength": ("FLOAT", {"default": 0.0, "min": -3.0, "max": 3.0, "step": 0.1,
-                                   "tooltip": "attention to the reference, log scale. 0 = as trained; +1 = about 2.7x more, "
-                                              "-1 = about 2.7x less. Non-zero values make sampling about 1.3x slower"}),
+            "strength": ("FLOAT", {"default": 0.0, "min": -3.0, "max": 3.0, "step": 0.1, "display_name": "strength (log)",
+                                   "tooltip": "attention to every reference, LOG scale: 0 = as trained; +0.7 = about 2x, "
+                                              "+1 = about 2.7x, -0.7 = about 0.5x. Not the scale of Strength on the simple "
+                                              "SnapRef node, which is linear (1 = as trained): simple 2 = +0.7 here, "
+                                              "simple 0.5 = -0.7"}),
             "ref_caption": ("STRING", {"multiline": True, "default": "",
                                        "tooltip": "optional appearance tags of the reference (gender, solo, hair, eyes, outfit); "
                                                   "no name or artist. Empty works."}),
@@ -582,8 +723,9 @@ class SnapRef:
                              "encoded on its own (sharper, slower with more references); stitch = side by side in one "
                              "ref_megapixels image (as Image Stitch, same speed as one reference)"}),
             "weight_1": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05,
-                                   "tooltip": "how much image (the first reference) counts; 1 = as trained. Only with "
-                                              "several references in multi_layout separate. No speed cost"}),
+                                   "tooltip": "how much image (the first reference) counts, LINEAR: 1 = as trained, "
+                                              "2 = twice, 0 = ignored (the scale of Strength on the simple SnapRef node). "
+                                              "Multiplies with strength (log). Ignored with multi_layout stitch"}),
             "weight_2": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05,
                                    "tooltip": "how much image_2 counts (e.g. 0.4: mostly the first image, a little of this "
                                               "one); 0 = ignored"}),
@@ -604,7 +746,9 @@ class SnapRef:
         if path not in _adapters:
             _adapters[path] = _Adapter(path)
         ad = _adapters[path]
-        _adapter_block_map(ad.block_indices, model.get_model_object("diffusion_model"))
+        dm = model.get_model_object("diffusion_model")
+        _adapter_block_map(ad.block_indices, dm)
+        _require_comfyui(dm)
         refs, weights = _reference_images([image, image_2, image_3], use_batch, [weight_1, weight_2, weight_3])
         if len(refs) > 1 and multi_layout == "stitch":
             refs, weights = [_stitch(refs)], [1.0]
@@ -645,8 +789,37 @@ import types as _types   # noqa: E402
 # the simple node reaches the core through a namespace (works both as a package module and as a loose file)
 SnapRefSimple = _simple.make_simple_node(_types.SimpleNamespace(
     _adapters=_adapters, _Adapter=_Adapter, _encode_image=_encode_image, _make_wrapper=_make_wrapper,
-    _adapter_block_map=_adapter_block_map, WRAPPER_KEY=WRAPPER_KEY))
-WEB_DIRECTORY = "./web"
-# "SnapRef" keeps its class name so saved workflows still load; it is shown as SnapRef (Advanced)
-NODE_CLASS_MAPPINGS = {"SnapRefSimple": SnapRefSimple, "SnapRef": SnapRef}
-NODE_DISPLAY_NAME_MAPPINGS = {"SnapRefSimple": "SnapRef", "SnapRef": "SnapRef (Advanced)"}
+    _adapter_block_map=_adapter_block_map, _require_comfyui=_require_comfyui, WRAPPER_KEY=WRAPPER_KEY))
+
+
+def _loaded_elsewhere() -> str | None:
+    """Folder of another SnapRef node package already loaded in this process (e.g. custom_nodes/snapref copied
+    from comfyui_nodes/ next to a clone of the whole repository), or None."""
+    here = os.path.dirname(os.path.realpath(__file__))
+    for mod in list(sys.modules.values()):
+        try:   # plain __dict__ read: never triggers a lazily loaded module
+            attrs = object.__getattribute__(mod, "__dict__")
+        except (AttributeError, TypeError):
+            continue
+        mapping = attrs.get("NODE_CLASS_MAPPINGS")
+        if attrs.get("WRAPPER_KEY") != WRAPPER_KEY or not isinstance(mapping, dict) \
+                or not ("SnapRef" in mapping or "SnapRefSimple" in mapping) or not attrs.get("__file__"):
+            continue
+        there = os.path.dirname(os.path.realpath(attrs["__file__"]))
+        if there != here:
+            return there
+    return None
+
+
+_ELSEWHERE = _loaded_elsewhere()
+if _ELSEWHERE is not None:
+    # register nothing (no second set of node classes, no second copy of the web extension)
+    logging.warning(f"[SnapRef] already loaded from {_ELSEWHERE}; skipping the copy in "
+                    f"{os.path.dirname(os.path.realpath(__file__))}. Keep only one SnapRef in custom_nodes.")
+    WEB_DIRECTORY = None
+    NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS = {}, {}
+else:
+    WEB_DIRECTORY = "./web"
+    # "SnapRef" keeps its class name so saved workflows still load; it is shown as SnapRef (Advanced)
+    NODE_CLASS_MAPPINGS = {"SnapRefSimple": SnapRefSimple, "SnapRef": SnapRef}
+    NODE_DISPLAY_NAME_MAPPINGS = {"SnapRefSimple": "SnapRef", "SnapRef": "SnapRef (Advanced)"}

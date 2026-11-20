@@ -1,0 +1,20 @@
+# ComfyUI Registry / ComfyUI Manager metadata for the SnapRef nodes (the repository root is the custom node,
+# see __init__.py). Not published yet: set PublisherId and the version before `comfy node publish`.
+# requirements.txt at the root is for training; the nodes need nothing beyond ComfyUI itself.
+[project]
+name = "snapref"
+description = "SnapRef: a reference adapter for Anima. Give Anima one picture of a character and write only the scene."
+version = "1.0.0"
+license = { file = "LICENSE" }
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/ArcAnima/SnapRef"
+
+[tool.comfy]
+PublisherId = ""
+DisplayName = "SnapRef"
+Icon = ""
+# Anima.preprocess_text_embeds(..., t5xxl_weights) and Attention.compute_qkv(..., transformer_options);
+# older builds are refused at the node with an update message
+requires-comfyui = ">=0.29.0"
