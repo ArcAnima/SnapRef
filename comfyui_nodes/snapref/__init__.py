@@ -30,6 +30,7 @@ Weight files keep the internal tensor format anima_ref_kv/1 (key prefix anima_re
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import logging
 import math
@@ -109,6 +110,31 @@ def _adapter_block_map(indices, model) -> tuple[int, ...]:
         return tuple(i for i in range(40) if i not in _INSERTED_29B)
     raise ValueError(f"Adapter covers {max(indices) + 1} blocks but the model has {model_blocks}. "
                      "Only native layouts and the 28-to-40-block Anima-2.9B expansion are supported.")
+
+
+MIN_COMFYUI = "0.14.0"   # Anima.preprocess_text_embeds(text_embeds, text_ids, t5xxl_weights): ComfyUI 76a7fa9
+
+
+def _require_comfyui(dm) -> None:
+    """Fail at the node, with a clear message, on a ComfyUI older than MIN_COMFYUI. Older builds have
+    preprocess_text_embeds(text_embeds, text_ids) and fail inside KSampler with "takes 3 positional arguments
+    but 4 were given"."""
+    fn = getattr(dm, "preprocess_text_embeds", None)
+    if not callable(fn):
+        return
+    try:
+        params = inspect.signature(fn).parameters.values()
+    except (TypeError, ValueError):
+        return
+    if any(p.kind is p.VAR_POSITIONAL for p in params) or \
+            sum(p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD) for p in params) >= 3:
+        return
+    try:
+        from comfyui_version import __version__ as found
+    except ImportError:
+        found = "unknown"
+    raise RuntimeError(f"SnapRef needs ComfyUI {MIN_COMFYUI} or newer (this ComfyUI: {found}; its "
+                       "Anima.preprocess_text_embeds takes no t5xxl_weights). Update ComfyUI and restart it.")
 
 
 class _Adapter:
@@ -676,7 +702,9 @@ class SnapRef:
         if path not in _adapters:
             _adapters[path] = _Adapter(path)
         ad = _adapters[path]
-        _adapter_block_map(ad.block_indices, model.get_model_object("diffusion_model"))
+        dm = model.get_model_object("diffusion_model")
+        _adapter_block_map(ad.block_indices, dm)
+        _require_comfyui(dm)
         refs, weights = _reference_images([image, image_2, image_3], use_batch, [weight_1, weight_2, weight_3])
         if len(refs) > 1 and multi_layout == "stitch":
             refs, weights = [_stitch(refs)], [1.0]
@@ -717,7 +745,7 @@ import types as _types   # noqa: E402
 # the simple node reaches the core through a namespace (works both as a package module and as a loose file)
 SnapRefSimple = _simple.make_simple_node(_types.SimpleNamespace(
     _adapters=_adapters, _Adapter=_Adapter, _encode_image=_encode_image, _make_wrapper=_make_wrapper,
-    _adapter_block_map=_adapter_block_map, WRAPPER_KEY=WRAPPER_KEY))
+    _adapter_block_map=_adapter_block_map, _require_comfyui=_require_comfyui, WRAPPER_KEY=WRAPPER_KEY))
 WEB_DIRECTORY = "./web"
 # "SnapRef" keeps its class name so saved workflows still load; it is shown as SnapRef (Advanced)
 NODE_CLASS_MAPPINGS = {"SnapRefSimple": SnapRefSimple, "SnapRef": SnapRef}
