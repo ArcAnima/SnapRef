@@ -868,12 +868,17 @@ class SnapRef:
 
 try:   # package import inside ComfyUI; plain file import in tests
     from . import simple as _simple   # noqa: E402
+    from . import adapter_info as _adapter_info   # noqa: E402
 except ImportError:
     import importlib.util as _ilu
     import os as _os
-    _spec = _ilu.spec_from_file_location("snapref_simple", _os.path.join(_os.path.dirname(__file__), "simple.py"))
-    _simple = _ilu.module_from_spec(_spec)
-    _spec.loader.exec_module(_simple)
+
+    def _load_sibling(name):
+        spec = _ilu.spec_from_file_location(f"snapref_{name}", _os.path.join(_os.path.dirname(__file__), f"{name}.py"))
+        module = _ilu.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    _simple, _adapter_info = _load_sibling("simple"), _load_sibling("adapter_info")
 
 import types as _types   # noqa: E402
 
@@ -881,6 +886,24 @@ import types as _types   # noqa: E402
 SnapRefSimple = _simple.make_simple_node(_types.SimpleNamespace(
     _adapters=_adapters, _Adapter=_Adapter, _encode_image=_encode_image, _make_wrapper=_make_wrapper,
     _adapter_block_map=_adapter_block_map, _require_comfyui=_require_comfyui, WRAPPER_KEY=WRAPPER_KEY))
+
+
+def _register_routes() -> None:
+    """GET /snapref/adapters: {"adapters": {file: {"modes", "style"} or {"error"}}} for the simple node's Style
+    button. Read-only (safetensors header metadata of the SnapRef files in models/loras); skipped outside ComfyUI."""
+    try:
+        from server import PromptServer
+        from aiohttp import web
+    except ImportError:
+        return
+    instance = getattr(PromptServer, "instance", None)
+    if instance is None:
+        return
+
+    @instance.routes.get("/snapref/adapters")
+    async def snapref_adapters(request):
+        return web.json_response({"adapters": _adapter_info.describe(
+            _simple.snapref_files(), lambda name: folder_paths.get_full_path("loras", name))})
 
 
 def _loaded_elsewhere() -> str | None:
@@ -911,6 +934,7 @@ if _ELSEWHERE is not None:
     NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS = {}, {}
 else:
     WEB_DIRECTORY = "./web"
+    _register_routes()   # once per process: a second copy registering the same route would stop the server
     # "SnapRef" keeps its class name so saved workflows still load; it is shown as SnapRef (Advanced)
     NODE_CLASS_MAPPINGS = {"SnapRefSimple": SnapRefSimple, "SnapRef": SnapRef}
     NODE_DISPLAY_NAME_MAPPINGS = {"SnapRefSimple": "SnapRef", "SnapRef": "SnapRef (Advanced)"}
