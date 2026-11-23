@@ -323,5 +323,64 @@ class TargetBranchTests(BranchTestCase):
                 self.assertTrue(all(c[1] == () for c in calls), calls)
 
 
+class ModeSchemaTests(BranchTestCase):
+    def schemas(self):
+        with patch.object(snapref.folder_paths, "get_filename_list", return_value=["snapref_v2s_pre.safetensors"], create=True),              patch.object(snapref._simple, "input_images", return_value=["a.png"]):
+            return snapref.SnapRef.INPUT_TYPES(), snapref.SnapRefSimple.INPUT_TYPES()
+
+    def test_schemas_offer_style(self):
+        advanced, simple = self.schemas()
+        self.assertEqual(advanced["required"]["mode"][0], ["cs", "char", "style"])
+        self.assertEqual(simple["required"]["mode"][0], ["Character & Style", "Character", "Style"])
+        self.assertEqual(simple["required"]["mode"][1]["default"], "Character & Style")
+        self.assertEqual(snapref._simple.MODES, {"Character & Style": "cs", "Character": "char", "Style": "style"})
+
+    def test_mode_tooltips_explain_style_and_the_prompt(self):
+        advanced, simple = self.schemas()
+        for tip in (advanced["required"]["mode"][1]["tooltip"], simple["required"]["mode"][1]["tooltip"]):
+            self.assertIn("style", tip)
+            self.assertIn("only the art style of the picture", tip)
+            self.assertIn("write the character and the scene in the prompt", tip)
+            self.assertIn("snapref_v2s_pre", tip)
+
+    def test_simple_apply_passes_style_key(self):
+        captured, checked = [], []
+
+        class Model:
+            def __init__(self): self.wrappers = {"diffusion": {}}
+            def clone(self): return Model()
+            def get_model_object(self, name): return object()
+            def add_wrapper_with_key(self, kind, key, value): self.wrappers[kind][key] = [value]
+
+        ad = SimpleNamespace(block_indices={0}, meta={}, check_mode=lambda mode, label: checked.append((mode, label)))
+        core = SimpleNamespace(_adapters={"adapter": ad}, _Adapter=None, _adapter_block_map=lambda *a: None,
+                               _encode_image=lambda m, v, px, size: (px, None), WRAPPER_KEY="snapref",
+                               _make_wrapper=lambda ad, lat, cond, mode, *a: captured.append(mode) or "wrapper")
+        cls = snapref._simple.make_simple_node(core)
+        clip = SimpleNamespace(tokenize=lambda s: s, encode_from_tokens_scheduled=lambda t: [("condition", {})])
+        with patch.object(snapref._simple.folder_paths, "get_full_path_or_raise", return_value="adapter", create=True),              patch.object(snapref._simple, "load_input_image", side_effect=lambda name: name),              patch.object(snapref._simple.comfy.patcher_extension, "WrappersMP", SimpleNamespace(DIFFUSION_MODEL="diffusion"),
+                          create=True):
+            for mode in ("Style", "Character & Style", "Character"):
+                cls().apply(Model(), clip, None, "snapref_v2s_pre.safetensors", "1.png", mode, 1.0, 1.0)
+        self.assertEqual(captured, ["style", "cs", "char"])
+        self.assertEqual(checked, [(m, "snapref_v2s_pre.safetensors") for m in ("style", "cs", "char")])
+
+    def test_style_with_plain_adapter_raises_before_encoding(self):
+        path = write_adapter(self.dir, name="snapref_v2a.safetensors", branches=False)
+        encoded = []
+        with patch.object(snapref.folder_paths, "get_full_path_or_raise", return_value=path, create=True),              patch.object(snapref, "_encode_image", side_effect=lambda *a: encoded.append(a)),              patch.dict(snapref._adapters, clear=True):
+            with self.assertRaisesRegex(ValueError, "has no 'style' mode"):
+                snapref.SnapRef().apply(None, None, None, torch.zeros(1, 8, 8, 3), "snapref_v2a.safetensors", "style",
+                                        False, 1.0)
+            core = SimpleNamespace(_adapters=snapref._adapters, _Adapter=snapref._Adapter, WRAPPER_KEY="snapref",
+                                   _adapter_block_map=lambda *a: None, _make_wrapper=None,
+                                   _encode_image=lambda *a: encoded.append(a))
+            with patch.object(snapref._simple.folder_paths, "get_full_path_or_raise", return_value=path, create=True),                  patch.object(snapref._simple, "load_input_image", side_effect=lambda name: encoded.append(name)):
+                with self.assertRaisesRegex(ValueError, "has no 'style' mode"):
+                    snapref._simple.make_simple_node(core)().apply(None, None, None, "snapref_v2a.safetensors", "1.png",
+                                                                   "Style", 1.0, 1.0)
+        self.assertEqual(encoded, [])
+
+
 if __name__ == "__main__":
     unittest.main()

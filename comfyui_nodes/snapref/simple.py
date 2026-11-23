@@ -1,4 +1,4 @@
-"""SnapRef (simple node): up to eight pictures of a character, Mode, Strength, Fidelity.
+"""SnapRef (simple node): up to eight pictures of a character (Style mode: of an art style), Mode, Strength, Fidelity.
 Everything else at the trained defaults; the full set of inputs is on SnapRef (Advanced) in __init__.py."""
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ import comfy.patcher_extension
 import folder_paths
 
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".avif")
-MODES = {"Character & Style": "cs", "Character": "char"}
+MODES = {"Character & Style": "cs", "Character": "char", "Style": "style"}   # Style needs an adapter with a style branch
 MAX_REFERENCES = 8
 
 
@@ -58,10 +58,14 @@ def make_simple_node(core):
                 "clip": ("CLIP",),
                 "vae": ("VAE",),
                 "adapter": (snapref_files(), {"tooltip": "SnapRef weights (models/loras)"}),
-                "reference": (images, {"image_upload": True, "tooltip": "a picture of the character"}),
+                "reference": (images, {"image_upload": True, "tooltip": "a picture of the character "
+                                                                         "(Style: a picture in the art style you want)"}),
                 "mode": (list(MODES), {"default": "Character & Style",
                                        "tooltip": "Character & Style: character and art style from the picture. Character: "
-                                                  "only the character; the style comes from the model and your prompt"}),
+                                                  "only the character; the style comes from the model and your prompt. "
+                                                  "Style: only the art style of the picture; write the character and "
+                                                  "the scene in the prompt; needs an adapter with a style branch, e.g. "
+                                                  "snapref_v2s_pre"}),
                 "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05,
                                        "tooltip": "how much the picture counts, LINEAR: 1 = as trained, 0 = off, 2 = twice. "
                                                   "SnapRef (Advanced) has a log-scale strength instead (0 = as trained; "
@@ -70,7 +74,8 @@ def make_simple_node(core):
                                        "tooltip": "1 = keep every detail of the picture; lower = follow the prompt more freely"}),
             }, "optional": {
                 "reference_2": (["none"] + images, {"default": "none",
-                                                   "tooltip": "a second picture of the same character (e.g. full body)"}),
+                                                   "tooltip": "a second picture of the same character (e.g. full "
+                                                              "body); Style: another picture by the same artist"}),
                 "strength_2": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05,
                                          "tooltip": "how much the second picture counts"}),
             }}
@@ -82,7 +87,8 @@ def make_simple_node(core):
         RETURN_TYPES = ("MODEL",)
         FUNCTION = "apply"
         CATEGORY = "SnapRef"
-        DESCRIPTION = "Reference a character with up to eight pictures. Write only the scene in the prompt."
+        DESCRIPTION = ("Reference a character with up to eight pictures (write only the scene in the prompt), or in "
+                       "Style mode an art style (write the character and the scene).")
 
         @classmethod
         def IS_CHANGED(cls, reference=None, reference_2="none", **kw):
@@ -105,6 +111,7 @@ def make_simple_node(core):
             if path not in core._adapters:
                 core._adapters[path] = core._Adapter(path)
             ad = core._adapters[path]
+            ad.check_mode(MODES[mode], adapter)   # style needs a style branch: say so before loading any picture
             refs, weights = [], []
             pairs = [(reference, strength), (reference_2, strength_2)]
             pairs.extend((kw.get(f"reference_{i}", "none"), kw.get(f"strength_{i}", 1.0))

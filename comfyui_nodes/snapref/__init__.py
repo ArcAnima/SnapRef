@@ -33,6 +33,10 @@ anima_ref_kv.branch.<branch>.<module>.down / up / alpha, described in the metada
 its stream's LoRA on the same module (or on its own where that stream has no LoRA). A reference-stream branch runs
 while the reference is encoded; a target-stream branch only in target calls (or batch rows) that read that
 reference. With no branch active every hook computes exactly what it did before, so cs / char are unchanged.
+
+Mode style (an adapter with a style branch, e.g. snapref_v2s_pre): the reference is a picture in the wanted art
+style and only that style is taken; write the character and the scene in the prompt. One mode per node: a
+character reference and a style reference together were never trained.
 """
 from __future__ import annotations
 
@@ -771,8 +775,11 @@ class SnapRef:
             "vae": ("VAE",),
             "image": ("IMAGE", {"tooltip": "the reference (first image of the batch)"}),
             "adapter": (_adapter_files(),),
-            "mode": (["cs", "char"], {"tooltip": "cs = character and style from the reference; "
-                                                 "char = character only (put artist tags in the prompt)"}),
+            "mode": (["cs", "char", "style"], {"tooltip": "cs = character and style from the reference; "
+                                                          "char = character only (put artist tags in the prompt); "
+                                                          "style = only the art style of the picture (write the "
+                                                          "character and the scene in the prompt; needs an adapter "
+                                                          "with a style branch, e.g. snapref_v2s_pre)"}),
             "ref_in_uncond": ("BOOLEAN", {"default": False, "tooltip": "off (trained default): only the positive "
                                           "branch reads the reference, so CFG pushes toward it. on: weaker, closer to the prompt"}),
             "ref_megapixels": ("FLOAT", {"default": 1.0, "min": 0.25, "max": 2.0, "step": 0.05,
@@ -828,6 +835,7 @@ class SnapRef:
         if path not in _adapters:
             _adapters[path] = _Adapter(path)
         ad = _adapters[path]
+        ad.check_mode(mode, adapter)   # style needs a style branch: say so before any encoding
         dm = model.get_model_object("diffusion_model")
         _adapter_block_map(ad.block_indices, dm)
         _require_comfyui(dm)
@@ -852,7 +860,8 @@ class SnapRef:
         if ref_guidance_on:
             m.set_model_sampler_post_cfg_function(_make_ref_guidance(ref_guidance, correction, ref_end))
         logging.info(f"[SnapRef] {adapter} step {ad.meta.get('step')}, "
-                     f"reference {', '.join(f'{a}x{b} w{w:g}' for (a, b), w in zip(sizes, weights))}, mode {mode}, "
+                     f"reference {', '.join(f'{a}x{b} w{w:g}' for (a, b), w in zip(sizes, weights))}, mode {mode}"
+                     f"{' (branches ' + ', '.join(ad.branches_for(mode)) + ')' if ad.branches_for(mode) else ''}, "
                      f"strength {strength}, fidelity {fidelity}, ref_guidance {ref_guidance if ref_guidance_on else 'off'}")
         return (m,)
 

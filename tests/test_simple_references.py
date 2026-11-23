@@ -27,7 +27,7 @@ class SimpleReferenceTests(unittest.TestCase):
             def clone(self): return Model()
             def get_model_object(self, name): return object()
             def add_wrapper_with_key(self, kind, key, value): self.wrappers[kind][key] = [value]
-        ad = SimpleNamespace(block_indices={0}, meta={})
+        ad = SimpleNamespace(block_indices={0}, meta={}, check_mode=lambda mode, label: None)
         core = SimpleNamespace(_adapters={'adapter': ad}, _Adapter=None, _adapter_block_map=lambda *a: None,
                                _encode_image=lambda m, v, px, size: (px, None), _make_wrapper=wrapper, WRAPPER_KEY='snapref')
         cls = simple.make_simple_node(core)
