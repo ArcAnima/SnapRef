@@ -71,3 +71,65 @@ test('restoring saved rows preserves height; adding a row grows once', () => {
   sync();
   assert.equal(node.size[1], 1040);
 });
+
+const plain = (r) => JSON.parse(JSON.stringify(r));
+const KEEP = '1 keeps every detail of the picture · lower follows your prompt more freely';
+
+test('modeCopy gives the style copy and falls back to cs', () => {
+  const modeCopy = vm.runInNewContext(`(${topLevel('modeCopy')})`);
+  assert.deepEqual(plain(modeCopy('Style')), { key: 'style', accent: '#a98bf5', tag: 'STYLE',
+    empty1: 'Artwork in the style you want', emptyN: 'optional · same artist', prompt: 'Write the character and the scene',
+    fidelity: "1 follows the picture's look closely · lower follows your prompt more freely" });
+  assert.deepEqual(plain(modeCopy('Character')), { key: 'char', accent: '#5b9cf5', tag: 'REFERENCE',
+    empty1: 'Character picture', emptyN: 'optional · same character',
+    prompt: 'Write the scene · add artist tags for the style', fidelity: KEEP });
+  const cs = { key: 'cs', accent: '#ff6b35', tag: 'REFERENCE', empty1: 'Character picture',
+    emptyN: 'optional · same character', prompt: 'Write only the scene', fidelity: KEEP };
+  assert.deepEqual(plain(modeCopy('Character & Style')), cs);
+  for (const unknown of ['Something else', undefined, null, '']) assert.deepEqual(plain(modeCopy(unknown)), cs);
+  assert.equal(modeCopy('style').key, 'style');   // the node's mode keys work too
+});
+
+test('styleSupport reads the adapter table', () => {
+  const styleSupport = vm.runInNewContext(`(${topLevel('styleSupport')})`);
+  const info = { adapters: {
+    'snapref_v2s_pre.safetensors': { modes: ['cs', 'char', 'style'], style: true },
+    'snapref_v2a.safetensors': { modes: ['cs', 'char'], style: false },
+    'snapref_partial.safetensors': { error: 'ValueError: header cut short (file incomplete)' },
+  } };
+  assert.equal(styleSupport(info, 'snapref_v2s_pre.safetensors'), true);
+  assert.equal(styleSupport(info, 'snapref_v2a.safetensors'), false);
+  assert.equal(styleSupport(info, 'snapref_partial.safetensors'), null);   // error: unknown, keep Style usable
+  assert.equal(styleSupport(info, 'snapref_new.safetensors'), null);       // not in the table
+  assert.equal(styleSupport(null, 'snapref_v2a.safetensors'), null);       // the request failed
+  assert.equal(styleSupport({}, 'snapref_v2a.safetensors'), null);
+  assert.equal(styleSupport(info.adapters, 'snapref_v2a.safetensors'), false);   // the bare table works too
+});
+
+test('style mode kept with a warning when the adapter lacks it', () => {
+  const ctx = vm.createContext({});
+  vm.runInContext(`${topLevel('modeNotice')}\n${topLevel('pickMode')}\n${topLevel('modeButton')}`, ctx);
+  const notice = 'This adapter has no Style mode. Choose snapref_v2s_pre or another style adapter.';
+  assert.equal(ctx.modeNotice('Style', false), notice);
+  assert.equal(ctx.modeNotice('Style', null), '');
+  assert.equal(ctx.modeNotice('Style', true), '');
+  assert.equal(ctx.modeNotice('Character', false), '');
+  // a saved Style value stays Style; clicking the dim Style button changes nothing, the others still work
+  assert.equal(ctx.pickMode('Style', 'Style', false), 'Style');
+  assert.equal(ctx.pickMode('Character', 'Style', false), 'Character');
+  assert.equal(ctx.pickMode('Style', 'Character', false), 'Character');
+  assert.equal(ctx.pickMode('Character', 'Style', null), 'Style');
+  assert.equal(ctx.pickMode('Character', 'Style', true), 'Style');
+  const tip = 'Style needs an adapter with a style branch (e.g. snapref_v2s_pre)';
+  assert.deepEqual(plain(ctx.modeButton('Style', 'Style', false)), { on: true, dis: true, title: tip });
+  assert.deepEqual(plain(ctx.modeButton('Style', 'Character', false)), { on: false, dis: true, title: tip });
+  assert.deepEqual(plain(ctx.modeButton('Style', 'Character', null)), { on: false, dis: false, title: '' });
+  assert.deepEqual(plain(ctx.modeButton('Character', 'Character', false)), { on: true, dis: false, title: '' });
+});
+
+test('the mode bar lays out every mode in one row', () => {
+  const seg = source.match(/\.sr-seg \{[^}]*\}/)[0];
+  assert.match(seg, /grid-auto-flow: column/);
+  assert.doesNotMatch(seg, /grid-template-columns/);
+  assert.match(source, /\.sr-seg button\.dis \{/);
+});
