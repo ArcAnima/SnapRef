@@ -225,5 +225,103 @@ def fake_encoder_model(block):
     return dm
 
 
+class ModuleExecutor:
+    """Stands for the diffusion model: one target forward through the hooked q_proj (tgt stream LoRA) and mlp (target
+    branch only); records the branch state of every call."""
+    def __init__(self, dm, calls):
+        self.class_obj, self.calls = dm, calls
+
+    def __call__(self, x, timesteps, context, fps=None, padding_mask=None, **kwargs):
+        self.calls.append((x.shape[0], snapref._STATE["branches"], snapref._STATE["reads_ref"], snapref._STATE["ref_rows"]))
+        block = self.class_obj.blocks[0]
+        return torch.cat([block.self_attn.q_proj(x), block.mlp(x)], dim=-1)
+
+
+def encode(*args):
+    return [(torch.ones(1, 1, 1, 2), torch.ones(1, 1, 1, 2))]
+
+
+Q = 0.5 * 3.0 * 2      # tgt stream LoRA on q_proj for x = ones
+DELTA = 0.5 * 7.0 * 4  # tgt branch on mlp for x = ones
+
+
+class TargetBranchTests(BranchTestCase):
+    def setUp(self):
+        super().setUp()
+        self.ad = snapref._Adapter(write_adapter(self.dir, name="v2t.safetensors"))
+        self.plain = snapref._Adapter(write_adapter(self.dir, name="v2a.safetensors", branches=False))
+
+    def call(self, ad, mode="style", flags=(0, 1), in_uncond=False, uncond_bias=None, per=1, mod_guidance=False,
+             no_ref=False, calls=None):
+        dm = BranchModel()
+        if mod_guidance:
+            dm._anima_mod_block_state = object()
+        B = per * len(flags)
+        options = {"cond_or_uncond": list(flags)}
+        if no_ref:
+            options[snapref.NO_REF_KEY] = True
+        wrapper = snapref._make_wrapper(ad, [torch.ones(1, 2)], (torch.ones(1, 1, 2), {}), mode, in_uncond,
+                                        uncond_bias=uncond_bias)
+        with patch.object(snapref, "_encode_reference", side_effect=encode):
+            out = wrapper(ModuleExecutor(dm, [] if calls is None else calls), torch.ones(B, 2), torch.zeros(B),
+                          torch.zeros(B, 1, 2), transformer_options=options)
+        self.assertEqual(snapref._STATE, {"adapter": None, "stream": None, "branches": (), "reads_ref": False,
+                                          "ref_rows": None})
+        return out
+
+    def assert_rows(self, out, branch_rows):
+        want = torch.tensor([[Q, Q, DELTA if r in branch_rows else 0.0, DELTA if r in branch_rows else 0.0]
+                             for r in range(out.shape[0])])
+        torch.testing.assert_close(out, want)
+
+    def test_tgt_branch_on_cond_only_by_default(self):
+        for flags in ((0, 1), (1, 0)):
+            with self.subTest(flags=flags):
+                calls = []
+                out = self.call(self.ad, flags=flags, calls=calls)
+                self.assert_rows(out, [flags.index(0)])
+                plain = self.call(self.plain, mode="cs", flags=flags)
+                uncond = flags.index(1)
+                self.assertTrue(torch.equal(out[uncond], plain[uncond]))
+                self.assertEqual(calls, [(1, ("style", "style_tgt"), True, None) if f == 0 else (1, (), False, None)
+                                         for f in flags])
+
+    def test_tgt_branch_on_both_with_ref_in_uncond(self):
+        self.assert_rows(self.call(self.ad, in_uncond=True), [0, 1])
+
+    def test_tgt_branch_whole_call_with_fidelity(self):
+        calls = []
+        self.assert_rows(self.call(self.ad, uncond_bias=-0.7, calls=calls), [0, 1])
+        self.assertEqual(calls, [(2, ("style", "style_tgt"), True, None)])
+
+    def test_tgt_branch_off_in_reference_free_call(self):
+        for kwargs in ({}, {"in_uncond": True}, {"uncond_bias": -0.7}):
+            with self.subTest(**kwargs):
+                out = self.call(self.ad, no_ref=True, **kwargs)
+                self.assert_rows(out, [])
+                self.assertTrue(torch.equal(out, self.call(self.plain, mode="cs", no_ref=True, **kwargs)))
+
+    def test_tgt_branch_rows_path_only_reference_rows(self):
+        for flags, per, rows in (((0, 1), 1, [0]), ((1, 0), 2, [2, 3])):
+            with self.subTest(flags=flags, per=per):
+                calls = []
+                out = self.call(self.ad, flags=flags, per=per, mod_guidance=True, calls=calls)
+                self.assert_rows(out, rows)
+                self.assertEqual(calls, [(2 * per, ("style", "style_tgt"), True, rows)])
+                plain = self.call(self.plain, mode="cs", flags=flags, per=per, mod_guidance=True)
+                others = [r for r in range(2 * per) if r not in rows]
+                self.assertTrue(torch.equal(out[others], plain[others]))
+
+    def test_cs_after_style_runs_no_branch(self):
+        for kwargs in ({}, {"in_uncond": True}, {"uncond_bias": -0.7}, {"mod_guidance": True}):
+            with self.subTest(**kwargs):
+                self.call(self.ad, mode="style", **kwargs)
+                calls = []
+                for mode in ("cs", "char"):
+                    out = self.call(self.ad, mode=mode, calls=calls, **kwargs)
+                    self.assertTrue(torch.equal(out, self.call(self.plain, mode=mode, **kwargs)))
+                self.assertTrue(all(c[1] == () for c in calls), calls)
+
+
 if __name__ == "__main__":
     unittest.main()

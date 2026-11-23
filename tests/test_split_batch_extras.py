@@ -38,7 +38,7 @@ def encode(*args):
 
 class SplitExtrasTests(unittest.TestCase):
     def setUp(self):
-        self.ad = type("Ad", (), {"cache": {}, "install": lambda self, dm: None})()
+        self.ad = type("Ad", (), {"cache": {}, "install": lambda self, dm: None, "branches_for": lambda self, mode: ()})()
         self.addCleanup(snapref._STATE.update, adapter=None, stream=None)
 
     def call(self, flags, in_uncond=False, uncond_bias=None, batch_per_chunk=1):

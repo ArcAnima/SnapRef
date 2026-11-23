@@ -16,7 +16,7 @@ class ModGuidanceTests(unittest.TestCase):
         delta, block_state = object(), object()
         dm.t_embedding_norm = SimpleNamespace(_anima_mod_delta=delta)
         dm._anima_mod_block_state = block_state
-        ad = SimpleNamespace(cache={}, install=lambda dm: None)
+        ad = SimpleNamespace(cache={}, install=lambda dm: None, branches_for=lambda mode: ())
         calls = []
         case = self
         class Executor:

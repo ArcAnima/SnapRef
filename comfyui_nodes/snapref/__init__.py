@@ -520,6 +520,7 @@ def _make_wrapper(adapter: _Adapter, ref_latents: list, ref_cond, mode: str, in_
     bias, in one call for the whole batch (fused kernels on CUDA fp16/bf16, the masked SDPA elsewhere)."""
     weights = list(weights or [1.0] * len(ref_latents))
     digest = _ref_digest(ref_latents, ref_cond, mode)
+    branches = adapter.branches_for(mode)   # () for cs / char: no branch ever runs
     biases = [bias + math.log(w) for w in weights]   # weight-0 references were dropped before encoding
     def wrapper(executor, x, timesteps, context, fps=None, padding_mask=None, **kwargs):
         dm = executor.class_obj
@@ -545,14 +546,15 @@ def _make_wrapper(adapter: _Adapter, ref_latents: list, ref_cond, mode: str, in_
             use = [f == 0 or in_uncond for f in flags]   # 0 = positive, 1 = negative
 
         def run(xs, ts, cs, with_ref, kw, pm=padding_mask):
-            # the "tgt" LoRA is on in every target forward, with or without the reference (as in training)
+            # the "tgt" LoRA is on in every target forward, with or without the reference (as in training); the
+            # mode's target branches only in a call that reads the reference
             _set_attn_state(dm, {"cache": cache, "sizes": sizes, "biases": biases} if with_ref else None)
-            _STATE.update(adapter=adapter, stream="tgt")
+            _STATE.update(_IDLE, adapter=adapter, stream="tgt", branches=branches if with_ref else (), reads_ref=with_ref)
             try:
                 return executor(xs, ts, cs, fps, pm, **kw)
             finally:
                 _set_attn_state(dm, None)
-                _STATE.update(adapter=None, stream=None)
+                _STATE.update(_IDLE)
         n = x.shape[0] // len(flags)
         if uncond_bias is not None and not options.get(NO_REF_KEY) and any(f == 1 for f in flags):
             # Fidelity: every row reads the reference, the uncond rows weaker (one call). On every device: without
@@ -560,12 +562,12 @@ def _make_wrapper(adapter: _Adapter, ref_latents: list, ref_cond, mode: str, in_
             rows = list(range(x.shape[0]))
             row_biases = [uncond_bias if flags[r // n] == 1 else 0.0 for r in rows]
             _set_attn_state(dm, {"cache": cache, "sizes": sizes, "biases": biases, "rows": rows, "row_biases": row_biases})
-            _STATE.update(adapter=adapter, stream="tgt")
+            _STATE.update(_IDLE, adapter=adapter, stream="tgt", branches=branches, reads_ref=True)   # every row reads it
             try:
                 return executor(x, timesteps, context, fps, padding_mask, **kwargs)
             finally:
                 _set_attn_state(dm, None)
-                _STATE.update(adapter=None, stream=None)
+                _STATE.update(_IDLE)
         if all(use) or not any(use):
             return run(x, timesteps, context, use[0], kwargs)
         if getattr(getattr(dm, "t_embedding_norm", None), "_anima_mod_delta", None) is not None \
@@ -573,12 +575,12 @@ def _make_wrapper(adapter: _Adapter, ref_latents: list, ref_cond, mode: str, in_
             # Mod Guidance's ambient hooks own this full CFG batch; mask reference rows instead of splitting it.
             rows = [r for r in range(x.shape[0]) if use[r // n]]
             _set_attn_state(dm, {"cache": cache, "sizes": sizes, "biases": biases, "rows": rows})
-            _STATE.update(adapter=adapter, stream="tgt")
+            _STATE.update(_IDLE, adapter=adapter, stream="tgt", branches=branches, reads_ref=True, ref_rows=rows)
             try:
                 return executor(x, timesteps, context, fps, padding_mask, **kwargs)
             finally:
                 _set_attn_state(dm, None)
-                _STATE.update(adapter=None, stream=None)
+                _STATE.update(_IDLE)
         # mixed cond/uncond batch (ComfyUI batches cond and uncond when their text lengths match, and Anima pads
         # every prompt to 512 tokens): run the two parts separately, each with its own share of the per-batch
         # extras (extra conds such as ppm NegPip's mask, cond_or_uncond / uuids / sigmas)
