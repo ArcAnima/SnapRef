@@ -26,6 +26,13 @@ side in one ~ref_megapixels reference instead (what Image Stitch does).
 
 Node: SnapRef (MODEL, CLIP, VAE, reference IMAGE, adapter) -> MODEL for KSampler.
 Weight files keep the internal tensor format anima_ref_kv/1 (key prefix anima_ref_kv.*).
+
+Mode-gated branches (SnapRef v2s and later, train/style_branch.py): an adapter may carry extra LoRAs,
+anima_ref_kv.branch.<branch>.<module>.down / up / alpha, described in the metadata as branches.<branch> =
+{stream, modes, rank, alpha, targets, combine: "add"}. A branch runs only in the modes it lists, added right after
+its stream's LoRA on the same module (or on its own where that stream has no LoRA). A reference-stream branch runs
+while the reference is encoded; a target-stream branch only in target calls (or batch rows) that read that
+reference. With no branch active every hook computes exactly what it did before, so cs / char are unchanged.
 """
 from __future__ import annotations
 
@@ -54,7 +61,12 @@ import folder_paths
 WRAPPER_KEY = "snapref"
 
 NO_REF_KEY = "snapref_off"   # transformer_options flag: run this call without the reference
-_STATE = {"adapter": None, "stream": None}   # LoRA hooks apply only while an adapter is active
+# LoRA hooks apply only while an adapter is active. branches: the branch LoRAs of the current mode; reads_ref: this
+# target call reads the reference; ref_rows: only these batch rows read it (target branches are masked to them)
+_IDLE = {"adapter": None, "stream": None, "branches": (), "reads_ref": False, "ref_rows": None}
+_STATE = dict(_IDLE)
+BRANCH_PREFIX = "anima_ref_kv.branch."
+BRANCH_MODES = ("style",)   # modes that exist only through a branch; cs / char work with every adapter
 _adapters: dict[str, "_Adapter"] = {}
 
 
@@ -173,9 +185,53 @@ class _Adapter:
             down, up = (self._dequant(tensors, root + n) for n in ("lora_down", "lora_up"))
             alpha = float(tensors[root + "alpha"])
             self.lora.setdefault(name, {})[stream] = [down, up, alpha / down.shape[0]]
-        self.block_indices = {int(n.split(".")[1]) for n in self.lora if n.startswith("blocks.")}
+        self.branches = self._read_branches(path, tensors)
+        modules = set(self.lora).union(*(b["modules"] for b in self.branches.values()))
+        self.block_indices = {int(n.split(".")[1]) for n in modules if n.startswith("blocks.")}
         self.hooked = weakref.WeakSet()   # diffusion models carrying our hooks (id() is reused after unload)
         self.cache: dict = {}
+
+    def _read_branches(self, path, tensors) -> dict:
+        """anima_ref_kv.branch.<branch>.<module>.down / up / alpha -> {branch: {"stream", "modes", "modules":
+        {module: [down, up, alpha / rank]}}}, in metadata order (train/style_branch.branch_tensors / load_adapter)."""
+        specs = self.meta.get("branches") or {}
+        found: dict[str, dict[str, list]] = {}
+        for key in tensors:
+            if not (key.startswith(BRANCH_PREFIX) and key.endswith(".down")):
+                continue
+            root = key[: -len("down")]
+            branch, name = root[len(BRANCH_PREFIX):-1].split(".", 1)
+            if branch not in specs:
+                raise ValueError(f"{path}: branch {branch} has weights but no metadata (branches.{branch})")
+            down, up = (self._dequant(tensors, root + n) for n in ("down", "up"))
+            alpha = float(tensors[root + "alpha"])
+            found.setdefault(branch, {})[name] = [down, up, alpha / down.shape[0]]
+        out: dict[str, dict] = {}
+        for branch, spec in specs.items():
+            stream, combine = spec.get("stream"), spec.get("combine", "add")
+            if stream not in ("ref", "tgt") or combine != "add":
+                raise ValueError(f"{path}: branch {branch} (stream {stream}, combine {combine}) is not supported "
+                                 "by this node (stream ref or tgt, combine add)")
+            if branch in found:
+                out[branch] = {"stream": stream, "modes": list(spec.get("modes") or []), "modules": found[branch]}
+        return out
+
+    def branches_for(self, mode: str) -> tuple[str, ...]:
+        """The branches that run in this mode, in metadata order (style_branch.branches_for); () for cs / char."""
+        return tuple(name for name, b in self.branches.items() if mode in b["modes"])
+
+    def check_mode(self, mode: str, label: str) -> None:
+        """cs / char: never an error (as before). style: the adapter must list the mode, carry its mode_embed row
+        and a branch for it; otherwise a clear error at the node instead of a silent cs-like render."""
+        if mode not in BRANCH_MODES:
+            return
+        if mode not in self.modes:
+            raise ValueError(f"SnapRef: {label} has no '{mode}' mode (its modes: {', '.join(self.modes)}). "
+                             "Style mode needs an adapter with a style branch, e.g. snapref_v2s_pre; "
+                             "use mode cs or char with this adapter.")
+        if self.mode_embed is None or self.mode_embed.shape[0] <= self.modes.index(mode) or not self.branches_for(mode):
+            raise ValueError(f"SnapRef: {label} lists the '{mode}' mode but has no mode_embed row or branch weights "
+                             "for it (anima_ref_kv.branch.*). Style mode needs an adapter such as snapref_v2s_pre.")
 
     @staticmethod
     def _dequant(tensors, key):
@@ -193,22 +249,46 @@ class _Adapter:
             return
         # Resolve everything first; a failed install must not be remembered as successful.
         targets = []
-        for name, streams in self.lora.items():
+        names = list(self.lora) + sorted({n for b in self.branches.values() for n in b["modules"]} - set(self.lora))
+        for name in names:
+            streams = self.lora.get(name, {})
+            # branch LoRAs on this module, metadata order: {branch: [down, up, scale, stream]}
+            branches = {b: e["modules"][name] + [e["stream"]] for b, e in self.branches.items() if name in e["modules"]}
             if name.startswith("blocks."):
                 _, index, suffix = name.split(".", 2)
                 name = f"blocks.{block_map[int(index)]}.{suffix}"
             module = dm.get_submodule(name)
-            targets.append((module, streams))
-        for module, streams in targets:
+            targets.append((module, streams, branches))
+        for module, streams, branches in targets:
 
-            def hook(mod, args, out, _streams=streams, _me=self):
-                if _STATE["adapter"] is not _me or _STATE["stream"] not in _streams:
+            def hook(mod, args, out, _streams=streams, _branches=branches, _me=self):
+                if _STATE["adapter"] is not _me:
                     return out
-                w = _streams[_STATE["stream"]]
+                stream = _STATE["stream"]
                 x = args[0]
-                if w[0].device != x.device or w[0].dtype != x.dtype:
-                    w[0], w[1] = w[0].to(x.device, x.dtype), w[1].to(x.device, x.dtype)
-                return out + F.linear(F.linear(x, w[0]), w[1]) * w[2]
+                w = _streams.get(stream)
+                if w is not None:
+                    if w[0].device != x.device or w[0].dtype != x.dtype:
+                        w[0], w[1] = w[0].to(x.device, x.dtype), w[1].to(x.device, x.dtype)
+                    out = out + F.linear(F.linear(x, w[0]), w[1]) * w[2]
+                if not _branches or not _STATE["branches"]:
+                    return out
+                # style_branch._forward: each active branch of this stream right after the stream LoRA; a target
+                # branch only in calls that read the reference (and only in the rows that read it)
+                for name in _STATE["branches"]:
+                    b = _branches.get(name)
+                    if b is None or b[3] != stream or (stream != "ref" and not _STATE["reads_ref"]):
+                        continue
+                    if b[0].device != x.device or b[0].dtype != x.dtype:
+                        b[0], b[1] = b[0].to(x.device, x.dtype), b[1].to(x.device, x.dtype)
+                    delta = F.linear(F.linear(x, b[0]), b[1]) * b[2]
+                    rows = _STATE["ref_rows"]
+                    if rows is not None and stream != "ref":
+                        mask = torch.zeros(delta.shape[0], device=delta.device, dtype=delta.dtype)
+                        mask[list(rows)] = 1
+                        delta = delta * mask.view(-1, *([1] * (delta.ndim - 1)))
+                    out = out + delta
+                return out
             module.register_forward_hook(hook)
         for index, block in enumerate(dm.blocks):
             attn = block.self_attn
@@ -394,7 +474,7 @@ def _encode_reference(adapter: _Adapter, dm, ref, context, target_hw, mode: str)
         t_emb = t_emb + adapter.mode_embed[adapter.modes.index(mode)].to(t_emb)[None, None, :]
     record = [None] * len(dm.blocks)
     _set_attn_state(dm, {"record": record})
-    _STATE.update(adapter=adapter, stream="ref")
+    _STATE.update(_IDLE, adapter=adapter, stream="ref", branches=adapter.branches_for(mode))   # () for cs / char
     try:
         # as MiniTrainDIT.forward: fp32 residual stream under fp16 compute (fp16 overflows -> NaN K/V -> black image)
         x = x_emb.float() if x_emb.dtype == torch.float16 else x_emb
@@ -403,7 +483,7 @@ def _encode_reference(adapter: _Adapter, dm, ref, context, target_hw, mode: str)
                       extra_per_block_pos_emb=None, transformer_options={})
     finally:
         _set_attn_state(dm, None)
-        _STATE.update(adapter=None, stream=None)
+        _STATE.update(_IDLE)
     return record
 
 
