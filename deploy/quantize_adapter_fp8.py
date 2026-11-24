@@ -3,7 +3,8 @@
     python deploy/quantize_adapter_fp8.py IN.safetensors OUT.safetensors
 
 Keys: <name>.lora_down / .lora_up become float8_e4m3fn, plus <name>.lora_down_scale / .lora_up_scale [rows, 1];
-alpha, mode_embed and metadata are copied. The ComfyUI node (comfyui_nodes/snapref) dequantizes at load,
+the mode-gated branch matrices of v2s and later (anima_ref_kv.branch.<branch>.<module>.down / .up) likewise, plus
+.down_scale / .up_scale; alpha, mode_embed and metadata are copied. The ComfyUI node (comfyui_nodes/snapref) dequantizes at load,
 so compute stays bf16: this halves the file and RAM, it does not speed anything up.
 """
 from __future__ import annotations
@@ -24,13 +25,20 @@ def quantize(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return (w / scale).to(torch.float8_e4m3fn), scale
 
 
+def is_matrix(key: str) -> bool:
+    """A LoRA matrix to store as FP8: stream LoRAs (.lora_down / .lora_up) and branch LoRAs (.down / .up)."""
+    if key.endswith((".lora_down", ".lora_up")):
+        return True
+    return key.startswith("anima_ref_kv.branch.") and key.endswith((".down", ".up"))
+
+
 def main(src: str, dst: str) -> int:
     tensors = load_file(src)
     with safe_open(src, "pt") as handle:
         metadata = dict(handle.metadata() or {})
     out, worst = {}, 0.0
     for key, value in tensors.items():
-        if key.endswith((".lora_down", ".lora_up")):
+        if is_matrix(key):
             q, scale = quantize(value)
             out[key], out[key + "_scale"] = q, scale
             back = q.float() * scale
@@ -42,7 +50,8 @@ def main(src: str, dst: str) -> int:
     metadata["anima_ref_kv"] = json.dumps(meta)
     save_file(out, dst, metadata=metadata)
     assert worst < 0.05, f"per-matrix relative error {worst:.4f} too large"
-    print(json.dumps({"out": dst, "matrices": sum(k.endswith(("lora_down", "lora_up")) for k in out),
+    print(json.dumps({"out": dst, "matrices": sum(is_matrix(k) for k in out),
+                      "branch_matrices": sum(is_matrix(k) and k.startswith("anima_ref_kv.branch.") for k in out),
                       "worst_matrix_rel_err": round(worst, 5)}))
     return 0
 
