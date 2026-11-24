@@ -299,7 +299,7 @@ class _Adapter:
                     b = _branches.get(name)
                     if b is None or b[3] != stream or (stream != "ref" and not _STATE["reads_ref"]):
                         continue
-                    down, up = _me.cast((_index, name), b, x)
+                    down, up = _me.cast((_index, "branch", name), b, x)   # a branch may share a stream's name
                     delta = F.linear(F.linear(x, down), up) * b[2]
                     rows = _STATE["ref_rows"]
                     if rows is not None and stream != "ref":
