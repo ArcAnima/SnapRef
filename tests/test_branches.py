@@ -358,7 +358,7 @@ class ModeSchemaTests(BranchTestCase):
                                _make_wrapper=lambda ad, lat, cond, mode, *a: captured.append(mode) or "wrapper")
         cls = snapref._simple.make_simple_node(core)
         clip = SimpleNamespace(tokenize=lambda s: s, encode_from_tokens_scheduled=lambda t: [("condition", {})])
-        with patch.object(snapref._simple.folder_paths, "get_full_path_or_raise", return_value="adapter", create=True),              patch.object(snapref._simple, "load_input_image", side_effect=lambda name: name),              patch.object(snapref._simple.comfy.patcher_extension, "WrappersMP", SimpleNamespace(DIFFUSION_MODEL="diffusion"),
+        with patch.object(snapref._simple.folder_paths, "get_full_path_or_raise", return_value="adapter", create=True),              patch.object(snapref._simple, "load_input_image", side_effect=lambda name: name),              patch.object(snapref._simple.comfy.patcher_extension, "WrappersMP", SimpleNamespace(DIFFUSION_MODEL="diffusion", OUTER_SAMPLE="outer"),
                           create=True):
             for mode in ("Style", "Character & Style", "Character"):
                 cls().apply(Model(), clip, None, "snapref_v2s_pre.safetensors", "1.png", mode, 1.0, 1.0)

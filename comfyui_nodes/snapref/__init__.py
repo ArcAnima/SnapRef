@@ -193,7 +193,24 @@ class _Adapter:
         modules = set(self.lora).union(*(b["modules"] for b in self.branches.values()))
         self.block_indices = {int(n.split(".")[1]) for n in modules if n.startswith("blocks.")}
         self.hooked = weakref.WeakSet()   # diffusion models carrying our hooks (id() is reused after unload)
-        self.cache: dict = {}
+        self.cache: dict = {}   # reference K/V, most recently used last, at most two (a SPEED run uses two target sizes)
+        self._cast: dict = {}   # (hooked module, stream or branch, device, dtype) -> (down, up), current sampling run only
+
+    def cast(self, key, w, x):
+        """down / up of one LoRA in x's device and dtype. The stored bf16 CPU matrices stay untouched, so a later
+        run in another dtype does not start from an fp16-rounded copy."""
+        key = (*key, x.device, x.dtype)
+        hit = self._cast.get(key)
+        if hit is None:
+            hit = self._cast[key] = (w[0].to(x.device, x.dtype), w[1].to(x.device, x.dtype))
+        return hit
+
+    def release(self) -> None:
+        """End of a sampling run: drop the device copies of the LoRA weights and park the reference K/V on the CPU,
+        so no VRAM outside ComfyUI's model management stays held during VAE decode or in workflows without SnapRef."""
+        self._cast.clear()
+        for key in self.cache:
+            self.cache[key] = _move_kv(self.cache[key], torch.device("cpu"))
 
     def _read_branches(self, path, tensors) -> dict:
         """anima_ref_kv.branch.<branch>.<module>.down / up / alpha -> {branch: {"stream", "modes", "modules":
@@ -263,18 +280,17 @@ class _Adapter:
                 name = f"blocks.{block_map[int(index)]}.{suffix}"
             module = dm.get_submodule(name)
             targets.append((module, streams, branches))
-        for module, streams, branches in targets:
+        for index, (module, streams, branches) in enumerate(targets):
 
-            def hook(mod, args, out, _streams=streams, _branches=branches, _me=self):
+            def hook(mod, args, out, _streams=streams, _branches=branches, _me=self, _index=index):
                 if _STATE["adapter"] is not _me:
                     return out
                 stream = _STATE["stream"]
                 x = args[0]
                 w = _streams.get(stream)
                 if w is not None:
-                    if w[0].device != x.device or w[0].dtype != x.dtype:
-                        w[0], w[1] = w[0].to(x.device, x.dtype), w[1].to(x.device, x.dtype)
-                    out = out + F.linear(F.linear(x, w[0]), w[1]) * w[2]
+                    down, up = _me.cast((_index, stream), w, x)
+                    out = out + F.linear(F.linear(x, down), up) * w[2]
                 if not _branches or not _STATE["branches"]:
                     return out
                 # style_branch._forward: each active branch of this stream right after the stream LoRA; a target
@@ -283,9 +299,8 @@ class _Adapter:
                     b = _branches.get(name)
                     if b is None or b[3] != stream or (stream != "ref" and not _STATE["reads_ref"]):
                         continue
-                    if b[0].device != x.device or b[0].dtype != x.dtype:
-                        b[0], b[1] = b[0].to(x.device, x.dtype), b[1].to(x.device, x.dtype)
-                    delta = F.linear(F.linear(x, b[0]), b[1]) * b[2]
+                    down, up = _me.cast((_index, name), b, x)
+                    delta = F.linear(F.linear(x, down), up) * b[2]
                     rows = _STATE["ref_rows"]
                     if rows is not None and stream != "ref":
                         mask = torch.zeros(delta.shape[0], device=delta.device, dtype=delta.dtype)
@@ -494,8 +509,19 @@ def _encode_reference(adapter: _Adapter, dm, ref, context, target_hw, mode: str)
 def _concat_kv(records: list[list]) -> list:
     if len(records) == 1:
         return records[0]
-    return [(torch.cat([r[i][0] for r in records], dim=1), torch.cat([r[i][1] for r in records], dim=1))
-            for i in range(len(records[0]))]
+    out = []
+    for i in range(len(records[0])):
+        out.append((torch.cat([r[i][0] for r in records], dim=1), torch.cat([r[i][1] for r in records], dim=1)))
+        for r in records:   # free each block's parts once joined: peak is one block over the K/V, not twice the K/V
+            r[i] = None
+    return out
+
+
+def _move_kv(entry, device):
+    kv, sizes = entry
+    if kv[0][0].device == device:
+        return entry
+    return [(k.to(device), v.to(device)) for k, v in kv], sizes
 
 
 def _model_token(dm) -> str:
@@ -531,8 +557,15 @@ def _make_wrapper(adapter: _Adapter, ref_latents: list, ref_cond, mode: str, in_
         adapter.install(dm)
         options = kwargs.get("transformer_options", {})
         key = (digest, _model_token(dm), tuple(x.shape[-2:]), x.dtype, x.device)
-        if key not in adapter.cache:
-            adapter.cache.clear()   # ~0.9 GB of K/V per 1 MP reference (bf16); keep one set
+        store = adapter.cache   # ~0.9 GB of K/V per 1 MP reference (bf16); only the set in use stays on the GPU
+        for other in [k for k in store if k != key]:
+            if other[1] != key[1]:   # a replaced model: its K/V are never read again
+                del store[other]
+            else:
+                store[other] = _move_kv(store[other], torch.device("cpu"))
+        if key in store:
+            store[key] = _move_kv(store.pop(key), x.device)
+        else:
             cross, meta = ref_cond
             ids, weights = meta.get("t5xxl_ids"), meta.get("t5xxl_weights")
             ctx = dm.preprocess_text_embeds(cross.to(x.device, x.dtype),
@@ -541,8 +574,11 @@ def _make_wrapper(adapter: _Adapter, ref_latents: list, ref_cond, mode: str, in_
             with _reference_context(dm):
                 records = [_encode_reference(adapter, dm, lat.to(x.device, x.dtype), ctx, tuple(x.shape[-2:]), mode)
                            for lat in ref_latents]
-            adapter.cache[key] = (_concat_kv(records), [r[0][0].shape[1] for r in records])
-        cache, sizes = adapter.cache[key]
+            sizes = [r[0][0].shape[1] for r in records]
+            store[key] = (_concat_kv(records), sizes)
+            while len(store) > 2:
+                del store[next(iter(store))]
+        cache, sizes = store[key]
         flags = options.get("cond_or_uncond") or [0]
         if options.get(NO_REF_KEY):   # the extra reference-free call of ref_guidance
             use = [False] * len(flags)
@@ -624,10 +660,13 @@ def _chunk_kwargs(kwargs: dict, sl: slice, batch: int, chunk: int, chunks: int) 
 
 
 def _make_outer(adapter: _Adapter):
-    """Kept for workflows that carry it; the reference cache now lives across runs (content-keyed, one entry),
-    so a second image with the same reference skips the reference encoding."""
+    """The reference cache lives across runs (content-keyed), so a second image with the same reference skips the
+    reference encoding; between runs it waits on the CPU (_Adapter.release)."""
     def wrapper(executor, *args, **kwargs):
-        return executor(*args, **kwargs)
+        try:
+            return executor(*args, **kwargs)
+        finally:
+            adapter.release()
     return wrapper
 
 
@@ -884,7 +923,7 @@ import types as _types   # noqa: E402
 
 # the simple node reaches the core through a namespace (works both as a package module and as a loose file)
 SnapRefSimple = _simple.make_simple_node(_types.SimpleNamespace(
-    _adapters=_adapters, _Adapter=_Adapter, _encode_image=_encode_image, _make_wrapper=_make_wrapper,
+    _adapters=_adapters, _Adapter=_Adapter, _encode_image=_encode_image, _make_wrapper=_make_wrapper, _make_outer=_make_outer,
     _adapter_block_map=_adapter_block_map, _require_comfyui=_require_comfyui, WRAPPER_KEY=WRAPPER_KEY))
 
 
