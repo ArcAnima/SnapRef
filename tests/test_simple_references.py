@@ -36,7 +36,7 @@ class SimpleReferenceTests(unittest.TestCase):
         extra.update(strength_3=0.0, strength_8=0.25)
         with patch.object(simple.folder_paths, 'get_full_path_or_raise', return_value='adapter', create=True), \
              patch.object(simple, 'load_input_image', side_effect=lambda name: name), \
-             patch.object(simple.comfy.patcher_extension, 'WrappersMP', SimpleNamespace(DIFFUSION_MODEL='diffusion'), create=True):
+             patch.object(simple.comfy.patcher_extension, 'WrappersMP', SimpleNamespace(DIFFUSION_MODEL='diffusion', OUTER_SAMPLE='outer'), create=True):
             cls().apply(Model(), clip, None, 'adapter', '1.png', 'Character', 1.0, 1.0, '2.png', 0.5)
             cls().apply(Model(), clip, None, 'adapter', '1.png', 'Character', 1.0, 1.0, '2.png', 0.5, **extra)
         self.assertEqual(captured[0], (['1.png', '2.png'], [1.0, 0.5]))

@@ -134,6 +134,8 @@ def make_simple_node(core):
                                    core._make_wrapper(ad, latents, cond, MODES[mode], False, 0.0, weights, uncond_bias))
             wr = m.wrappers[comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL]
             m.wrappers[comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL] = {core.WRAPPER_KEY: wr.pop(core.WRAPPER_KEY), **wr}
+            if hasattr(core, "_make_outer"):   # parks the reference K/V on the CPU after each sampling run
+                m.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.OUTER_SAMPLE, core.WRAPPER_KEY, core._make_outer(ad))
             logging.info(f"[SnapRef] {adapter}: {len(refs)} picture(s), {mode}, strength {weights}, fidelity {fidelity}")
             return (m,)
 
