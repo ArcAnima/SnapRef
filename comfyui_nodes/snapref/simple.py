@@ -130,8 +130,10 @@ def make_simple_node(core):
             # Fidelity f: the negative branch also reads the picture, weighted (1 - f); f = 1 is the trained default
             uncond_bias = None if fidelity >= 1.0 else math.log(max(1.0 - float(fidelity), 1e-6))
             m = model.clone()
-            m.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, core.WRAPPER_KEY,
-                                   core._make_wrapper(ad, latents, cond, MODES[mode], False, 0.0, weights, uncond_bias))
+            wrapper = core._make_wrapper(ad, latents, cond, MODES[mode], False, 0.0, weights, uncond_bias)
+            if hasattr(core, "_chain"):   # after another SnapRef node: one wrapper reading the references of both
+                wrapper = core._chain(m, wrapper)
+            m.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, core.WRAPPER_KEY, wrapper)
             wr = m.wrappers[comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL]
             m.wrappers[comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL] = {core.WRAPPER_KEY: wr.pop(core.WRAPPER_KEY), **wr}
             if hasattr(core, "_make_outer"):   # parks the reference K/V on the CPU after each sampling run

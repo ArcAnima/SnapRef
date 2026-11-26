@@ -37,6 +37,11 @@ reference. With no branch active every hook computes exactly what it did before,
 Mode style (an adapter with a style branch, e.g. snapref_v2s_pre): the reference is a picture in the wanted art
 style and only that style is taken; write the character and the scene in the prompt. One mode per node: a
 character reference and a style reference together were never trained.
+
+Chained nodes (SnapRef -> SnapRef -> KSampler on one adapter, e.g. mode char then mode style): the references of
+both nodes are read together, each encoded in its own node's mode, as several references of one node are (_chain).
+No new weights are needed where the target stream is the same in every mode (v2s PRE1: the style branch is on the
+reference stream), but the mix is untrained. strength / weights stay with their node; Fidelity is the last node's.
 """
 from __future__ import annotations
 
@@ -177,6 +182,7 @@ class _Adapter:
             self.meta = json.loads(md.get("snapref") or md.get("anima_ref_kv") or "{}")
         if self.meta.get("format") != "anima_ref_kv/1":
             raise ValueError(f"{path} is not an anima_ref_kv/1 adapter")
+        self.name = os.path.basename(path)
         self.ref_t = int(self.meta.get("ref_t", 10))
         self.modes = list(self.meta.get("modes", ["cs"]))
         self.mode_embed = tensors.get("anima_ref_kv.mode_embed")
@@ -549,9 +555,19 @@ def _make_wrapper(adapter: _Adapter, ref_latents: list, ref_cond, mode: str, in_
     """uncond_bias (Fidelity < 1): the negative branch also reads the reference with this extra log
     bias, in one call for the whole batch (fused kernels on CUDA fp16/bf16, the masked SDPA elsewhere)."""
     weights = list(weights or [1.0] * len(ref_latents))
-    digest = _ref_digest(ref_latents, ref_cond, mode)
-    branches = adapter.branches_for(mode)   # () for cs / char: no branch ever runs
-    biases = [bias + math.log(w) for w in weights]   # weight-0 references were dropped before encoding
+    group = {"latents": list(ref_latents), "cond": ref_cond, "mode": mode,
+             "biases": [bias + math.log(w) for w in weights],   # weight-0 references were dropped before encoding
+             "digest": _ref_digest(ref_latents, ref_cond, mode)}
+    return _group_wrapper(adapter, [group], in_uncond, uncond_bias)
+
+
+def _group_wrapper(adapter: _Adapter, groups: list, in_uncond: bool, uncond_bias: float | None = None):
+    """One wrapper over the reference groups of one node, or of chained nodes (_chain). A group is one node's
+    references with their mode, reference text and biases; the K/V of all groups are concatenated in order."""
+    digest = "+".join(g["digest"] for g in groups)
+    # the branches of every mode in the set; one group: adapter.branches_for(mode), () for cs / char
+    branches = tuple(dict.fromkeys(name for g in groups for name in adapter.branches_for(g["mode"])))
+    biases = [b for g in groups for b in g["biases"]]
     def wrapper(executor, x, timesteps, context, fps=None, padding_mask=None, **kwargs):
         dm = executor.class_obj
         adapter.install(dm)
@@ -566,14 +582,16 @@ def _make_wrapper(adapter: _Adapter, ref_latents: list, ref_cond, mode: str, in_
         if key in store:
             store[key] = _move_kv(store.pop(key), x.device)
         else:
-            cross, meta = ref_cond
-            ids, weights = meta.get("t5xxl_ids"), meta.get("t5xxl_weights")
-            ctx = dm.preprocess_text_embeds(cross.to(x.device, x.dtype),
-                                            None if ids is None else ids.unsqueeze(0).to(x.device),
-                                            None if weights is None else weights.unsqueeze(0).unsqueeze(-1).to(x.device, x.dtype))
+            ctxs = []
+            for g in groups:   # each group with its own reference text and mode
+                cross, meta = g["cond"]
+                ids, weights = meta.get("t5xxl_ids"), meta.get("t5xxl_weights")
+                ctxs.append(dm.preprocess_text_embeds(cross.to(x.device, x.dtype),
+                                                      None if ids is None else ids.unsqueeze(0).to(x.device),
+                                                      None if weights is None else weights.unsqueeze(0).unsqueeze(-1).to(x.device, x.dtype)))
             with _reference_context(dm):
-                records = [_encode_reference(adapter, dm, lat.to(x.device, x.dtype), ctx, tuple(x.shape[-2:]), mode)
-                           for lat in ref_latents]
+                records = [_encode_reference(adapter, dm, lat.to(x.device, x.dtype), ctx, tuple(x.shape[-2:]), g["mode"])
+                           for g, ctx in zip(groups, ctxs) for lat in g["latents"]]
             sizes = [r[0][0].shape[1] for r in records]
             store[key] = (_concat_kv(records), sizes)
             while len(store) > 2:
@@ -630,7 +648,40 @@ def _make_wrapper(adapter: _Adapter, ref_latents: list, ref_cond, mode: str, in_
             outs.append(run(x[sl], timesteps[sl], context[sl], u, _chunk_kwargs(kwargs, sl, x.shape[0], i, len(flags)),
                             _chunk_tensor(padding_mask, sl, x.shape[0])))
         return torch.cat(outs, dim=0)
+    wrapper._snapref = {"adapter": adapter, "groups": groups, "in_uncond": in_uncond, "uncond_bias": uncond_bias}
     return wrapper
+
+
+def _chain(m, wrapper):
+    """SnapRef after SnapRef. m: the cloned patcher the node is about to add wrapper to. Where m already carries the
+    wrapper of an earlier SnapRef node, that one is taken off and one wrapper over the references of both is
+    returned, each group encoded in its own node's mode (e.g. char then style); otherwise wrapper itself.
+    Two nested wrappers would read only the inner one's reference: each sets the attention state of every block.
+
+    strength / weights are per reference and stay with their node. The negative branch reads the references if any
+    of the nodes asks for it (ref_in_uncond, ref_guidance_on); otherwise the last node's Fidelity applies."""
+    kinds = comfy.patcher_extension.WrappersMP
+    stack = m.wrappers.get(kinds.DIFFUSION_MODEL, {})
+    held = [w for w in stack.get(WRAPPER_KEY, []) if hasattr(w, "_snapref")]
+    if not held:
+        return wrapper
+    old, new = held[-1]._snapref, wrapper._snapref
+    if old["adapter"] is not new["adapter"]:
+        raise ValueError("SnapRef: SnapRef nodes connected one after another must use the same adapter file (the "
+                         f"earlier node has {old['adapter'].name}, this one {new['adapter'].name}). For a character "
+                         "and a style reference together select an adapter with Style mode, e.g. snapref_v2s_pre1, "
+                         "in both.")
+    in_uncond = old["in_uncond"] or new["in_uncond"]
+    uncond_bias = None if in_uncond else new["uncond_bias"]
+    groups = old["groups"] + new["groups"]
+    stack.pop(WRAPPER_KEY)
+    m.wrappers.get(kinds.OUTER_SAMPLE, {}).pop(WRAPPER_KEY, None)   # the node adds its own
+    if (old["in_uncond"], old["uncond_bias"]) != (in_uncond, uncond_bias):
+        logging.info("[SnapRef] chained nodes: ref_in_uncond / Fidelity are shared by all references; an earlier "
+                     "node's setting was overridden")
+    logging.info(f"[SnapRef] chained after another SnapRef node: {sum(len(g['latents']) for g in groups)} references, "
+                 f"modes {' + '.join(g['mode'] for g in groups)} (a mix of modes was not trained)")
+    return _group_wrapper(new["adapter"], groups, in_uncond, uncond_bias)
 
 
 def _chunk_tensor(value, sl, batch):
@@ -890,8 +941,8 @@ class SnapRef:
         cond = clip.encode_from_tokens_scheduled(clip.tokenize(ref_caption.strip()))[0]
         uncond_bias = None if fidelity >= 1.0 or ref_in_uncond or ref_guidance_on else math.log(max(1.0 - float(fidelity), 1e-6))
         m = model.clone()
-        m.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, WRAPPER_KEY,
-                               _make_wrapper(ad, latents, cond, mode, ref_in_uncond or ref_guidance_on, strength, weights, uncond_bias))
+        m.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, WRAPPER_KEY, _chain(m, _make_wrapper(
+            ad, latents, cond, mode, ref_in_uncond or ref_guidance_on, strength, weights, uncond_bias)))
         # outermost: a wrapper that runs the blocks itself without calling executor (Anzhc Mod Guidance) would skip ours
         dm_wrappers = m.wrappers[comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL]
         m.wrappers[comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL] = {WRAPPER_KEY: dm_wrappers.pop(WRAPPER_KEY), **dm_wrappers}
@@ -924,7 +975,7 @@ import types as _types   # noqa: E402
 # the simple node reaches the core through a namespace (works both as a package module and as a loose file)
 SnapRefSimple = _simple.make_simple_node(_types.SimpleNamespace(
     _adapters=_adapters, _Adapter=_Adapter, _encode_image=_encode_image, _make_wrapper=_make_wrapper, _make_outer=_make_outer,
-    _adapter_block_map=_adapter_block_map, _require_comfyui=_require_comfyui, WRAPPER_KEY=WRAPPER_KEY))
+    _chain=_chain, _adapter_block_map=_adapter_block_map, _require_comfyui=_require_comfyui, WRAPPER_KEY=WRAPPER_KEY))
 
 
 def _register_routes() -> None:
